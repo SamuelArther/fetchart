@@ -35,6 +35,8 @@ What art do you want?
 
 For key art, also pick portrait or landscape. Then choose from a list of every image found, biggest first, and pick a folder. fetchart remembers the last folder you used.
 
+Move through the menus with the arrow keys and press Enter, or type a number to jump to it. On the image and achievement lists, press **P** to see every option as a numbered picture in your browser. For achievements, Space ticks as many as you want and A ticks them all.
+
 ## Install
 
 ### Windows, macOS, Linux: standalone download

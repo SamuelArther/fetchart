@@ -27,6 +27,7 @@ Its public metadata dump is downloaded once and indexed into a local SQLite file
 """
 
 import argparse
+import base64
 import difflib
 import html
 import io
@@ -34,6 +35,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -41,12 +43,13 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 UA = {"User-Agent": f"fetchart/{__version__} (+https://github.com/SamuelArther/fetchart)"}
 LB_DUMP = "https://gamesdb.launchbox-app.com/Metadata.zip"
@@ -210,18 +213,127 @@ def ask(prompt, default=None):
     return answer or default
 
 
-def choose(title, options, default=1, auto=False, allow_all=False):
-    """Numbered menu over display strings. Returns the picked index, or -1 for 'all'."""
+# ---------------------------------------------------------------- menus
+
+def arrow_keys_ok():
+    """Arrow-key menus need a real console on both ends; piped input gets the numbered prompts."""
+    return sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
+def enable_ansi():
+    """Let the classic Windows console understand the escape codes the menus redraw with."""
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle, mode = kernel.GetStdHandle(-11), ctypes.c_uint32()
+        if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
+def read_key():
+    """One keypress: up, down, pgup, pgdn, home, end, enter, space, esc, ctrl-c, or the character typed."""
+    if os.name == "nt":
+        import msvcrt
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            return {"H": "up", "P": "down", "I": "pgup", "Q": "pgdn", "G": "home", "O": "end"}.get(msvcrt.getwch(), "")
+    else:
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = os.read(fd, 1).decode(errors="ignore")
+            if ch == "\x1b" and select.select([fd], [], [], 0.05)[0]:
+                return {"[A": "up", "[B": "down", "[5~": "pgup", "[6~": "pgdn", "[H": "home", "[F": "end",
+                        "OH": "home", "OF": "end"}.get(os.read(fd, 8).decode(errors="ignore"), "")
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    return {"\r": "enter", "\n": "enter", " ": "space", "\x1b": "esc", "\x03": "ctrl-c"}.get(ch, ch)
+
+
+def arrow_menu(title, rows, default=0, multi=False, preview=None):
+    """Menu driven by the arrow keys (typing a number jumps to it). Returns the picked row index,
+    or with multi=True the ticked indexes (just the highlighted row if none are ticked)."""
+    enable_ansi()
+    n, cols = len(rows), shutil.get_terminal_size().columns
+    height = max(3, min(n, shutil.get_terminal_size().lines - 5))
+    width = len(str(n))
+    keys = ("Up/Down move, Enter " + ("done, Space tick, A all" if multi else "pick")
+            + (", P preview in browser" if preview else "") + ", Esc quit")
+    cur, top, ticked, typed, note, drawn = default, 0, set(), "", "", 0
+    print()
+    sys.stdout.write("\x1b[?25l")  # hide the cursor while the menu is up
+    try:
+        while True:
+            top = min(max(top, cur - height + 1), cur)
+            out = [(title + (f"  ({cur + 1} of {n})" if n > height else ""))[:cols - 1]]
+            for i in range(top, top + height):
+                box = ("[x] " if i in ticked else "[ ] ") if multi else ""
+                text = f"{'>' if i == cur else ' '} {i + 1:>{width}}) {box}{rows[i]}"[:cols - 1]
+                out.append(f"\x1b[7m{text}\x1b[0m" if i == cur else text)
+            out.append(f"\x1b[2m{(note or keys)[:cols - 1]}\x1b[0m")
+            sys.stdout.write((f"\x1b[{drawn}F\x1b[J" if drawn else "") + "\n".join(out) + "\n")
+            sys.stdout.flush()
+            drawn, note = len(out), ""
+
+            key = read_key()
+            typed = typed + key if key.isdigit() else ""
+            if key.isdigit():
+                if not 1 <= int(typed) <= n:
+                    typed = key
+                if 1 <= int(typed) <= n:
+                    cur = int(typed) - 1
+            elif key == "up":
+                cur = (cur - 1) % n
+            elif key == "down":
+                cur = (cur + 1) % n
+            elif key in ("pgup", "pgdn"):
+                cur = max(0, cur - height) if key == "pgup" else min(n - 1, cur + height)
+            elif key in ("home", "end"):
+                cur = 0 if key == "home" else n - 1
+            elif key == "space" and multi:
+                ticked ^= {cur}
+            elif key.lower() == "a" and multi:
+                ticked = set() if len(ticked) == n else set(range(n))
+            elif key.lower() == "p" and preview:
+                preview()
+                note = "Preview opened in your browser."
+            elif key in ("esc", "ctrl-c"):
+                sys.stdout.write("\x1b[?25h\n")
+                sys.exit(1)
+            elif key == "enter":
+                picked = (sorted(ticked) or [cur]) if multi else cur
+                summary = (rows[cur] if not multi or picked == [cur] else f"{len(picked)} picked")
+                sys.stdout.write(f"\x1b[{drawn}F\x1b[J" + f"{title} {summary}"[:cols - 1] + "\n")
+                return picked
+    finally:
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+
+
+def choose(title, options, default=1, auto=False, allow_all=False, preview=None):
+    """Menu over display strings. Returns the picked index, or -1 for 'all'.
+    preview, if given, is called when the user asks to see the options."""
     if len(options) == 1 or auto:
         return default - 1
+    if arrow_keys_ok():
+        i = arrow_menu(title, options + (["All of them"] if allow_all else []), default - 1, preview=preview)
+        return -1 if i == len(options) else i
     print(f"\n{title}")
     for i, opt in enumerate(options, 1):
         print(f"  {i}) {opt}")
     if allow_all:
         print("  a) all of them")
-    hint = f"1-{len(options)}" + (", a" if allow_all else "")
+    hint = f"1-{len(options)}" + (", a" if allow_all else "") + (", p = preview" if preview else "")
     while True:
         answer = ask(f"Pick [{hint}, Enter = {default}]: ", str(default))
+        if preview and answer.lower() == "p":
+            preview()
+            print("  Preview opened in your browser.")
+            continue
         if allow_all and answer.lower() in ("a", "all"):
             return -1
         if answer.isdigit() and 1 <= int(answer) <= len(options):
@@ -229,13 +341,20 @@ def choose(title, options, default=1, auto=False, allow_all=False):
         print("  Not an option, try again.")
 
 
-def choose_many(title, options):
-    """Numbered menu where several can be picked: '3', '1,4,9', '10-20' or 'a' for all. Returns indexes."""
+def choose_many(title, options, preview=None):
+    """Menu where several can be picked. Typed: '3', '1,4,9', '10-20' or 'a' for all. Returns indexes."""
+    if arrow_keys_ok():
+        return arrow_menu(title, options, multi=True, preview=preview)
     print(f"\n{title}")
     for i, opt in enumerate(options, 1):
         print(f"  {i}) {opt}")
     while True:
-        answer = ask("Pick one or more (e.g. 3 or 1,4,9 or 10-20) [Enter = all]: ", "a").lower().replace(" ", "")
+        answer = ask("Pick one or more (e.g. 3 or 1,4,9 or 10-20" + (", p = preview" if preview else "")
+                     + ") [Enter = all]: ", "a").lower().replace(" ", "")
+        if preview and answer == "p":
+            preview()
+            print("  Preview opened in your browser.")
+            continue
         if answer in ("a", "all"):
             return list(range(len(options)))
         picked = []
@@ -579,7 +698,8 @@ def download_achievements(title, plat, args, cfg):
             entries.append((f"Achievement icon {n}", f"achievement {n:0{width}d}", data, None))
 
     picked = entries if args.yes or (args.quality or "").lower() == "all" else \
-        [entries[i] for i in choose_many("Which ones?", [e[0] for e in entries])]
+        [entries[i] for i in choose_many("Which ones?", [e[0] for e in entries], preview=lambda: open_preview(
+            f"{title} achievements", [(e[0], data_uri(e[2]) if e[2] else e[3], None) for e in entries], small=True))]
     folder = pick_folder(args.out, cfg, args.yes) / safe_filename(f"{title} [{plat}] achievements")
     folder.mkdir(parents=True, exist_ok=True)
     saved = 0
@@ -702,8 +822,9 @@ class Art:
     """One downloadable option. crop = cut to 2:3 portrait; logo = clear-logo URL to lay on top;
     scale = resize a small square icon up to this many pixels."""
 
-    def __init__(self, url, source, crop=False, logo=None, scale=None):
+    def __init__(self, url, source, crop=False, logo=None, scale=None, preview=None):
         self.url, self.source, self.crop, self.logo, self.scale = url, source, crop, logo, scale
+        self.preview = preview  # a smaller copy to show in the browser preview, when the original is huge
         self.size = None
         self.fingerprint = None
 
@@ -1010,17 +1131,18 @@ def painting_main(args, query, cfg):
             source += f" ({mb} MB)"
     except (urllib.error.URLError, OSError, ValueError):
         pass
-    options = [Art(url, source)]
+    small = commons_thumb(url, 1280) if original.get("width", 0) > 1280 else None
+    options = [Art(url, source, preview=small)]
     for width in (3840, 1920):
         thumb = commons_thumb(url, width)
         if thumb and width < original.get("width", 0):
-            options.append(Art(thumb, f"Wikimedia Commons, resized to {width} wide"))
+            options.append(Art(thumb, f"Wikimedia Commons, resized to {width} wide", preview=small))
     finish(options, f"{page['title']} - {page.get('description') or 'artwork'}", args, cfg, require_size=True)
 
 
 # ---------------------------------------------------------------- main
 
-def pick_art(options, wanted, auto):
+def pick_art(options, wanted, auto, heading):
     """options are sorted best-first. Returns the list of picked options."""
     if wanted:
         w = wanted.lower()
@@ -1040,8 +1162,71 @@ def pick_art(options, wanted, auto):
     if len(options) == 1:
         print(f"\nOnly one option: {options[0].label()}")
         return options
-    i = choose("Which one? (biggest first)", [o.label() for o in options], auto=auto, allow_all=True)
+    cards = [(o.label(), o.preview or o.url, o) for o in options]
+    i = choose("Which one? (biggest first)", [o.label() for o in options], auto=auto, allow_all=True,
+               preview=lambda: open_preview(heading, cards))
     return options if i == -1 else [options[i]]
+
+
+PREVIEW_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fetchart preview</title>
+<style>
+  :root { --bg: #f4f4f5; --card: #ffffff; --text: #18181b; --muted: #71717a; --line: #e4e4e7; --accent: #2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121214; --card: #1c1c20; --text: #f4f4f5; --muted: #a1a1aa; --line: #2e2e33; --accent: #60a5fa; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--text);
+         font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { max-width: 1400px; margin: 0 auto 20px; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  header p { margin: 0; color: var(--muted); }
+  main { max-width: 1400px; margin: 0 auto; display: grid; gap: 16px;
+         grid-template-columns: repeat(auto-fill, minmax(MINpx, 1fr)); }
+  figure { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .pic { position: relative; display: flex; align-items: center; justify-content: center; min-height: 140px;
+         padding: 12px; background: repeating-conic-gradient(var(--line) 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+  .pic > img:first-child { max-width: 100%; max-height: 420px; object-fit: contain; }
+  .pic.crop > img:first-child { aspect-ratio: 2 / 3; height: 420px; object-fit: cover; }
+  .pic.small > img:first-child { width: 128px; height: 128px; image-rendering: pixelated; }
+  .logo { position: absolute; left: 50%; bottom: 10%; transform: translateX(-50%); width: 45%; max-height: 30%;
+          object-fit: contain; filter: drop-shadow(2px 3px 4px rgba(0, 0, 0, .6)); }
+  .crop .logo { width: 70%; }
+  .num { position: absolute; top: 8px; left: 8px; min-width: 32px; padding: 3px 8px; border-radius: 999px;
+         background: var(--accent); color: #fff; font-weight: 700; text-align: center; }
+  figcaption { padding: 10px 12px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums;
+               overflow-wrap: anywhere; }
+</style></head>
+<body>
+<header><h1>TITLE</h1><p>Go back to the terminal and pick the number you want.</p></header>
+<main>
+TILES
+</main>
+</body></html>
+"""
+
+
+def data_uri(data):
+    kind = {".png": "png", ".gif": "gif", ".webp": "webp"}.get(image_ext(data), "jpeg")
+    return f"data:image/{kind};base64," + base64.b64encode(data).decode()
+
+
+def open_preview(heading, cards, small=False):
+    """Show the options as numbered pictures in the browser. cards: [(label, image src, Art or None)]."""
+    tiles = []
+    for n, (label, src, art) in enumerate(cards, 1):
+        classes = "pic" + (" crop" if art and art.crop else "") + (" small" if small else "")
+        logo = f'<img class="logo" src="{html.escape(art.logo)}" alt="">' if art and art.logo else ""
+        tiles.append(f'<figure><div class="{classes}"><img src="{html.escape(src)}" alt="">{logo}'
+                     f'<span class="num">{n}</span></div><figcaption>{html.escape(label)}</figcaption></figure>')
+    page = (PREVIEW_PAGE.replace("MIN", "200" if small else "280").replace("TITLE", html.escape(heading))
+            .replace("TILES", "\n".join(tiles)))
+    path = DATA_DIR / "preview.html"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(page, encoding="utf-8")
+    webbrowser.open(path.as_uri())
 
 
 def pick_folder(cli_folder, cfg, auto):
@@ -1155,7 +1340,7 @@ def finish(options, name_prefix, args, cfg, require_size=False):
         sys.exit("Couldn't find any art for that.")
     options.sort(key=lambda o: -(o.final_size()[0] * o.final_size()[1] if o.final_size() else 0))
 
-    picked = pick_art(options, args.quality, args.yes)
+    picked = pick_art(options, args.quality, args.yes, name_prefix)
     folder = pick_folder(args.out, cfg, args.yes)
     print()
     for art in picked:
