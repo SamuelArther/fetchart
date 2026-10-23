@@ -203,7 +203,8 @@ def split_year(query):
 
 
 def safe_filename(name):
-    return re.sub(r'[<>:"/\\|?*]+', "_", name).strip(" .") or "art"
+    name = re.sub(r"\s*:\s*", " - ", name)  # "Minecraft: Xbox 360 Edition" -> "Minecraft - Xbox 360 Edition"
+    return re.sub(r'[<>"/\\|?*]+', "_", name).strip(" .") or "art"
 
 
 def ask(prompt, default=None):
@@ -1540,8 +1541,9 @@ def pick_folder(cli_folder, cfg, auto):
     folder = cli_folder or (default if auto else ask(f"\nSave to which folder? [Enter = {default}]: ", default))
     folder = Path(os.path.expandvars(os.path.expanduser(folder.strip().strip('"').strip("'"))))
     folder.mkdir(parents=True, exist_ok=True)
-    cfg["last_folder"] = str(folder.resolve())
-    save_config(cfg)
+    if not cli_folder:  # a one-off -o shouldn't change the folder the menus suggest
+        cfg["last_folder"] = str(folder.resolve())
+        save_config(cfg)
     return folder
 
 
