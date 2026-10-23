@@ -1,23 +1,39 @@
 # fetchart
 
-Find and download game art, movie and TV posters, and album covers from the command line. No API keys or accounts are needed.
+Find and download game art, movie and TV posters, album covers and paintings from the command line. No API keys or accounts are needed.
 
 For games, it covers about 190,000 titles on every platform: box covers, key art (with or without the logo), console dashboard tiles, and every Xbox 360 achievement icon.
 
-```
-fetchart halo-combat-evolved xbox
-```
+Just type `fetchart` in PowerShell, Command Prompt or any terminal:
 
 ```
+What are you looking for?
+  1) Video game
+  2) Movie or TV show
+  3) Music (album cover)
+  4) Painting / real art
+```
+
+Type the name, then pick the right one from the matches. Each game appears once, and you pick the platform after it:
+
+```
+Which game?
+  1) DOOM  [23 platforms]
+  2) DOOM 3  [7 platforms]
+  ...
+Which platform is DOOM on?
+  1) Windows (2016)
+  2) MS-DOS (1993)
+  3) Super Nintendo Entertainment System (1995)
+  ...
 What art do you want?
   1) Box cover art (the retail cover, rating and all)
   2) Key art, no logo
   3) Key art, with logo
   4) Dashboard icon / tile (the square on the console menu)
-  5) Xbox 360 achievement icons (all of them)
 ```
 
-Pick the art type and the game. For key art, also pick portrait or landscape. Then choose from a list of every image found, biggest first, and pick a folder. fetchart remembers the last folder you used.
+For key art, also pick portrait or landscape. Then choose from a list of every image found, biggest first, and pick a folder. fetchart remembers the last folder you used.
 
 ## Install
 
@@ -31,7 +47,7 @@ Grab the file for your system from the [latest release](https://github.com/Samue
 | macOS   | `fetchart-macos`       |
 | Linux   | `fetchart-linux`       |
 
-You can double-click it and it will ask for the game name. To use `fetchart` as a command in any terminal, rename the file to `fetchart` (`fetchart.exe` on Windows) and put it in a folder on your `PATH`.
+You can double-click it and it will show the menus. To use `fetchart` as a command in any terminal, rename the file to `fetchart` (`fetchart.exe` on Windows) and put it in a folder on your `PATH`.
 
 On macOS and Linux, make the file runnable first:
 
@@ -50,6 +66,8 @@ pipx install git+https://github.com/SamuelArther/fetchart
 `pip install git+https://github.com/SamuelArther/fetchart` works too.
 
 ## Usage
+
+Run `fetchart` with no arguments for the menus above. To skip them, put everything on one line:
 
 ```
 fetchart <game> [platform] [options]
@@ -75,20 +93,24 @@ fetchart zelda-ocarina-of-time n64 -t clean -r portrait
 fetchart gears-of-war -t ach
 ```
 
-### Movies, TV and albums
+### Movies, TV, albums and paintings
 
-Use `movie`, `tv` or `album` in place of a platform:
+Use `movie`, `tv`, `album` or `painting` in place of a platform:
 
 ```
 fetchart inception movie
 fetchart breaking-bad tv
 fetchart "pink floyd dark side of the moon" album
+fetchart "the starry night" painting
 ```
 
 | Type | Where it comes from | Typical size |
 |---|---|---|
 | Movie / TV posters | IMDb, Wikipedia | up to 2000x3000 |
 | Album covers | Apple Music, Deezer, Cover Art Archive | 1200–3000 px |
+| Paintings | Wikimedia Commons museum scans | the full scan, plus 3840 and 1920 wide copies |
+
+Some museum scans are huge (The Starry Night is 663 MB), so the menu shows the file size of big originals.
 
 For albums, the artist plus the album name finds the right one fastest.
 
@@ -132,7 +154,7 @@ Xbox 360 title IDs are looked up through [XboxUnity](http://xboxunity.net/).
 
 ## Credits and disclaimer
 
-The art comes from the LaunchBox Games Database community, Steam, the Microsoft Store, Xbox Live, XboxUnity, Nintendo, IMDb, Wikipedia, Deezer, Apple Music, and MusicBrainz / the Cover Art Archive. Thanks to all of them for keeping it online.
+The art comes from the LaunchBox Games Database community, Steam, the Microsoft Store, Xbox Live, XboxUnity, Nintendo, IMDb, Wikipedia, Wikimedia Commons, Deezer, Apple Music, and MusicBrainz / the Cover Art Archive. Thanks to all of them for keeping it online.
 
 All art belongs to its respective owners. fetchart is meant for personal use, such as emulator frontends, media servers, desktop wallpapers and collection catalogs. It is not affiliated with any of the sites it pulls from, or with any game, film or music company.
 

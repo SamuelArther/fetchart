@@ -1,6 +1,7 @@
-"""fetchart - find and download game art from the command line.
+"""fetchart - find and download game art, posters, album covers and paintings from the command line.
 
 Usage:
+    fetchart                     menus for everything: category, name, platform, art, folder
     fetchart <game> [platform] [-t box|clean|logo|icon|ach] [-r portrait|landscape] [-q QUALITY] [-o FOLDER] [-y]
     fetchart --update            re-download the game database
 
@@ -13,10 +14,11 @@ Art types:
                                                       squares, Nintendo eShop icons, Steam + LaunchBox icons)
     ach     every Xbox 360 achievement icon          (the Xbox Live image server, by title ID)
 
-Movies, TV and music (use the platform word movie, tv or album):
+Movies, TV, music and paintings (use the platform word movie, tv, album or painting):
     fetchart inception movie                         posters from IMDb and Wikipedia
     fetchart breaking-bad tv
     fetchart "pink floyd dark side of the moon" album   covers from Deezer, Apple Music, Cover Art Archive
+    fetchart "the starry night" painting             museum scans from Wikimedia Commons
 
 The LaunchBox Games Database (gamesdb.launchbox-app.com) covers ~190k games on every platform.
 Its public metadata dump is downloaded once and indexed into a local SQLite file.
@@ -41,7 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 UA = {"User-Agent": f"fetchart/{__version__} (+https://github.com/SamuelArther/fetchart)"}
 LB_DUMP = "https://gamesdb.launchbox-app.com/Metadata.zip"
@@ -54,13 +56,14 @@ DB_MAX_AGE = 30 * 86400
 
 KEEP_TYPES = {"Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front",
               "Fanart - Background", "Clear Logo", "Banner", "Poster", "Square", "Icon"}
-DB_SCHEMA = 2  # bump when KEEP_TYPES or the table layout changes, to force a rebuild
+DB_SCHEMA = 3  # bump when KEEP_TYPES or the table layout changes, to force a rebuild
 NEEDED_TYPES = {
     "box": ("Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front"),
     "clean": ("Fanart - Background",),
     "logo": ("Fanart - Background", "Banner", "Poster"),
     "icon": (),  # icons mostly come from console stores, so any game qualifies
     "ach": (),
+    None: (),  # art type not picked yet
 }
 ART_TYPES = {
     "box": "Box cover art (the retail cover, rating and all)",
@@ -69,6 +72,7 @@ ART_TYPES = {
     "icon": "Dashboard icon / tile (the square on the console menu)",
     "ach": "Xbox 360 achievement icons (all of them)",
 }
+XBOX360 = "Microsoft Xbox 360"
 REGION_ORDER = ["North America", "United States", "World", None, "Canada", "Europe", "United Kingdom",
                 "Australia", "Oceania", "Japan"]
 
@@ -107,6 +111,10 @@ PLATFORMS = {
 
 
 # ---------------------------------------------------------------- helpers
+
+class NotFound(Exception):
+    """A search came up empty. The menus ask for another name; the command line exits."""
+
 
 def http_get(url, headers=None, timeout=30):
     req = urllib.request.Request(url, headers={**UA, **(headers or {})})
@@ -187,6 +195,9 @@ def pil():
         from PIL import Image, ImageFilter
     except ImportError:
         sys.exit("This needs Pillow:  python -m pip install pillow")
+    # Museum scans run past a gigapixel, which trips Pillow's decompression-bomb guard even when only
+    # reading the size. Every image here comes from a known art host.
+    Image.MAX_IMAGE_PIXELS = None
     return Image, ImageFilter
 
 
@@ -211,14 +222,14 @@ def build_index():
     tmp.unlink(missing_ok=True)
     db = sqlite3.connect(tmp)
     db.executescript("""
-        CREATE TABLE games (id INTEGER PRIMARY KEY, name TEXT, platform TEXT, votes INTEGER);
+        CREATE TABLE games (id INTEGER PRIMARY KEY, name TEXT, platform TEXT, votes INTEGER, year INTEGER);
         CREATE TABLE names (id INTEGER, name TEXT, norm TEXT);
         CREATE TABLE images (id INTEGER, type TEXT, region TEXT, file TEXT);
     """)
     games, names, images = [], [], []
 
     def flush():
-        db.executemany("INSERT OR IGNORE INTO games VALUES (?,?,?,?)", games)
+        db.executemany("INSERT OR IGNORE INTO games VALUES (?,?,?,?,?)", games)
         db.executemany("INSERT INTO names VALUES (?,?,?)", names)
         db.executemany("INSERT INTO images VALUES (?,?,?,?)", images)
         games.clear(), names.clear(), images.clear()
@@ -229,8 +240,10 @@ def build_index():
             if tag == "Game":
                 gid, name = el.findtext("DatabaseID"), el.findtext("Name") or ""
                 if gid and name:
+                    year = el.findtext("ReleaseYear") or (el.findtext("ReleaseDate") or "")[:4]
                     games.append((int(gid), name, el.findtext("Platform") or "",
-                                  int(el.findtext("CommunityRatingCount") or 0)))
+                                  int(el.findtext("CommunityRatingCount") or 0),
+                                  int(year) if year.isdigit() else None))
                     names.append((int(gid), name, norm(name)))
             elif tag == "GameAlternateName":
                 gid, name = el.findtext("DatabaseID"), el.findtext("AlternateName") or ""
@@ -289,7 +302,8 @@ def resolve_platform(db, text):
 
 
 def search_games(db, query, platform, kind):
-    """Best-matching games that actually have art of the wanted kind: [(id, name, platform)]."""
+    """Best-matching games that have art of the wanted kind (any game if kind is None),
+    best first: [(id, name, platform, year, votes)]."""
     words = sorted(norm(query).split(), key=len, reverse=True)
     if not words:
         return []
@@ -297,19 +311,39 @@ def search_games(db, query, platform, kind):
     has_art = (f"AND EXISTS (SELECT 1 FROM images i WHERE i.id = g.id AND i.type IN ({','.join('?' * len(needed))}))"
                if needed else "")
     sql = f"""
-        SELECT g.id, g.name, g.platform, g.votes, n.name FROM names n JOIN games g ON g.id = n.id
+        SELECT g.id, g.name, g.platform, g.year, g.votes, n.name FROM names n JOIN games g ON g.id = n.id
         WHERE n.norm LIKE ? {"AND g.platform = ?" if platform else ""}
         {has_art}
     """
     params = [f"%{words[0]}%"] + ([platform] if platform else []) + list(needed)
     best = {}
-    for gid, name, plat, votes, alias in db.execute(sql, params):
-        # Well-known releases outrank hacks and homebrew that share the name.
-        s = score(query, alias) + min(0.2, math.log10(votes + 1) * 0.07)
+    for gid, name, plat, year, votes, alias in db.execute(sql, params):
+        # Well-known releases outrank hacks and homebrew that share the name, and a game's own name
+        # outranks a collection that lists it as an alternate name.
+        s = score(query, alias) + min(0.2, math.log10(votes + 1) * 0.07) + (0.1 if alias == name else 0)
         if s > best.get(gid, (0,))[0]:
-            best[gid] = (s, name, plat)
+            best[gid] = (s, name, plat, year, votes)
     ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
-    return [(gid, name, plat) for gid, (s, name, plat) in ranked[:12] if s > 0.35]
+    return [(gid, name, plat, year, votes) for gid, (s, name, plat, year, votes) in ranked if s > 0.35]
+
+
+def group_games(games, limit=12):
+    """One entry per game name, holding every platform it came out on (most popular first)."""
+    groups = {}
+    for game in games:  # already best match first, so the dict keeps that order
+        groups.setdefault(norm(game[1]), []).append(game)
+    return [sorted(g, key=lambda game: -game[4]) for g in list(groups.values())[:limit]]
+
+
+def group_label(group):
+    name = group[0][1]
+    if len(group) == 1:
+        return f"{name}  [{group[0][2]}]"
+    return f"{name}  [{len(group)} platforms]"
+
+
+def platform_label(game):
+    return f"{game[2]} ({game[3]})" if game[3] else game[2]
 
 
 def game_images(db, gid):
@@ -525,7 +559,7 @@ class Art:
 
     def label(self):
         s = self.final_size()
-        return (f"{s[0]}x{s[1]}" if s else "size ?").ljust(11) + self.source
+        return (f"{s[0]}x{s[1]}" if s else "size ?").ljust(12) + self.source
 
 
 def probe_size(art):
@@ -661,7 +695,15 @@ def render(art):
 # ---------------------------------------------------------------- movies, TV and albums
 
 MEDIA = {"movie": "movie", "movies": "movie", "film": "movie", "tv": "tv", "show": "tv", "tvshow": "tv",
-         "series": "tv", "album": "album", "music": "album", "cd": "album", "song": "album"}
+         "series": "tv", "album": "album", "music": "album", "cd": "album", "song": "album",
+         "painting": "painting", "paintings": "painting", "art": "painting", "artwork": "painting"}
+# Top menu when fetchart is run with no arguments: key -> (menu text, name prompt)
+CATEGORIES = {
+    "game": ("Video game", "Game name: "),
+    "screen": ("Movie or TV show", "Movie or show name: "),
+    "album": ("Music (album cover)", "Album (artist + album name works best): "),
+    "painting": ("Painting / real art", "Painting name (add the artist if you know it): "),
+}
 TV_TYPES = {"tvSeries", "tvMiniSeries"}
 
 
@@ -727,8 +769,8 @@ def cover_art_archive(artist, album):
     return f"https://coverartarchive.org/release-group/{group['id']}/front" if group else None
 
 
-def media_main(args, media, cfg):
-    query = re.sub(r"[-_]+", " ", args.game).strip()
+def media_main(args, query, cfg, media):
+    """media is album, movie, tv, or screen (movies and TV together)."""
     if media == "album":
         print(f'Searching albums for "{query}"...')
         try:
@@ -736,7 +778,7 @@ def media_main(args, media, cfg):
         except (urllib.error.URLError, ValueError) as e:
             sys.exit(f"Network error: {e}")
         if not albums:
-            sys.exit(f'No album found for "{query}". Try "artist album".')
+            raise NotFound(f'No album found for "{query}". Try "artist album".')
         album = albums[choose("Which album?", [f"{a['title']}  -  {a['artist']['name']}" for a in albums],
                               auto=args.yes)]
         title, artist = album["title"], album["artist"]["name"]
@@ -751,21 +793,71 @@ def media_main(args, media, cfg):
         return finish(options, f"{artist} - {title} - album cover", args, cfg, require_size=True)
 
     print(f'Searching IMDb for "{query}"...')
-    items = [d for d in imdb_search(query) if d.get("l") and d.get("qid")]
-    wanted = [d for d in items if (d["qid"] in TV_TYPES) == (media == "tv")] or items
-    if not wanted:
-        sys.exit(f'Nothing on IMDb for "{query}".')
-    item = wanted[choose("Which one?", [f"{d['l']}  ({d.get('y', '?')})  [{d.get('q', d['qid'])}]" for d in wanted],
-                         auto=args.yes)]
+    items = [d for d in imdb_search(query) if d.get("l") and d.get("qid") and d["qid"] != "videoGame"]
+    if media != "screen":
+        items = [d for d in items if (d["qid"] in TV_TYPES) == (media == "tv")] or items
+    if not items:
+        raise NotFound(f'Nothing on IMDb for "{query}".')
+    item = items[choose("Which one?", [f"{d['l']}  ({d.get('y', '?')})  [{d.get('q', d['qid'])}]" for d in items],
+                        auto=args.yes)]
     title = f"{item['l']} ({item['y']})" if item.get("y") else item["l"]
     print(f"Finding posters for {title}...")
     options = []
     if item.get("i", {}).get("imageUrl"):
         options.append(Art(item["i"]["imageUrl"], "IMDb poster"))
-    wiki = wiki_infobox_image(f"{item['l']} {item.get('y', '')} {'TV series' if media == 'tv' else 'film'}", item["l"])
+    kind = "TV series" if item["qid"] in TV_TYPES else "film"
+    wiki = wiki_infobox_image(f"{item['l']} {item.get('y', '')} {kind}", item["l"])
     if wiki:
         options.append(Art(wiki, "Wikipedia poster"))
     finish(options, f"{title} - poster", args, cfg, require_size=True)
+
+
+# ---------------------------------------------------------------- paintings
+
+def commons_thumb(url, width):
+    """Wikimedia's resized copy of an uploaded image, or None if it can't make one."""
+    m = re.match(r"(https://upload\.wikimedia\.org/wikipedia/[^/]+/)(.+/([^/]+\.(?:jpe?g|png)))$", url, re.I)
+    return f"{m[1]}thumb/{m[2]}/{width}px-{m[3]}" if m else None
+
+
+def painting_main(args, query, cfg):
+    """Paintings and other artworks, from the Wikipedia article's lead image on Wikimedia Commons."""
+    print(f'Searching paintings for "{query}"...')
+    pages = []
+    # Articles about a single artwork carry the "Infobox artwork" template; fall back to a plain search.
+    for search in (f'{query} hastemplate:"Infobox artwork"', f"{query} painting"):
+        try:
+            found = get_json("https://en.wikipedia.org/w/api.php", {
+                "action": "query", "format": "json", "generator": "search", "gsrsearch": search,
+                "gsrlimit": 12, "prop": "pageimages|description", "piprop": "original"})
+        except (urllib.error.URLError, ValueError) as e:
+            sys.exit(f"Network error: {e}")
+        pages = sorted(found.get("query", {}).get("pages", {}).values(), key=lambda pg: pg.get("index", 0))
+        pages = [pg for pg in pages if pg.get("original")]
+        if pages:
+            break
+    if not pages:
+        raise NotFound(f'No painting found for "{query}". Try adding the artist.')
+    page = pages[choose("Which one?", [f"{pg['title']}  -  {pg.get('description', 'artwork')}" for pg in pages],
+                        auto=args.yes)]
+    original = page["original"]
+    url = original["source"].split("?")[0]
+    print(f"Finding scans of {page['title']}...")
+    source = "Wikimedia Commons, original"
+    try:  # museum scans can be hundreds of MB, so say so before anyone picks one
+        req = urllib.request.Request(url, method="HEAD", headers=UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            mb = int(r.headers.get("Content-Length") or 0) >> 20
+        if mb >= 20:
+            source += f" ({mb} MB)"
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    options = [Art(url, source)]
+    for width in (3840, 1920):
+        thumb = commons_thumb(url, width)
+        if thumb and width < original.get("width", 0):
+            options.append(Art(thumb, f"Wikimedia Commons, resized to {width} wide"))
+    finish(options, f"{page['title']} - {page.get('description') or 'artwork'}", args, cfg, require_size=True)
 
 
 # ---------------------------------------------------------------- main
@@ -813,10 +905,11 @@ def unique_path(path):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="fetchart", description="Find and download game, movie and album art.")
+    p = argparse.ArgumentParser(prog="fetchart", description="Find and download game art, posters, album covers "
+                                                              "and paintings. Run it with no arguments for menus.")
     p.add_argument("game", nargs="?", help='name, e.g. halo-combat-evolved or "the dark side of the moon"')
     p.add_argument("platform", nargs="?",
-                   help="pc, xbox, x360, ps2, n64, gc, wii, switch, gba, ... (default: all), or movie, tv, album")
+                   help="pc, xbox, x360, ps2, n64, gc, wii, switch, gba, ... (default: all), or movie, tv, album, painting")
     p.add_argument("-t", "--type", choices=list(ART_TYPES), help="box, clean (no logo), logo, icon, or ach (360 achievements)")
     p.add_argument("-r", "--orient", choices=["portrait", "landscape"], help="key art orientation")
     p.add_argument("-q", "--quality", help="low, medium, high, all, or an exact size like 1920x1080")
@@ -825,46 +918,69 @@ def main():
     p.add_argument("--update", action="store_true", help="re-download the game database")
     p.add_argument("--version", action="version", version=f"fetchart {__version__}")
     args = p.parse_args()
-    if not args.game and not args.update:
-        # Launched with no arguments (e.g. double-clicked): ask instead of erroring out.
-        args.game = ask("Game, movie or album name: ")
-        if not args.game:
-            p.error("which game?")
-        args.platform = args.platform or ask(
-            "Platform (pc, xbox, x360, ps2, switch, ... or movie, tv, album. Enter = any game): ")
-
-    media = MEDIA.get(re.sub(r"[^a-z]", "", (args.platform or "").lower()))
-    if media:
-        return media_main(args, media, load_config())
-
-    db = open_index(args.update)
-    if not args.game:
+    if args.update and not args.game:
+        open_index(force_update=True)
         return
-    query = re.sub(r"[-_]+", " ", args.game).strip()
-    platform = resolve_platform(db, args.platform)
+
+    # With no name given (typed alone, or double-clicked), everything is asked through menus.
+    interactive = not args.game
+    if interactive:
+        category = list(CATEGORIES)[choose("What are you looking for?", [c[0] for c in CATEGORIES.values()])]
+    else:
+        category = MEDIA.get(re.sub(r"[^a-z]", "", (args.platform or "").lower()), "game")
     cfg = load_config()
+    while True:
+        if interactive:
+            args.game = ask("\n" + CATEGORIES[category][1])
+            if not args.game:
+                return
+        query = re.sub(r"[-_]+", " ", args.game).strip()
+        try:
+            if category == "game":
+                return game_main(args, query, cfg)
+            if category == "painting":
+                return painting_main(args, query, cfg)
+            return media_main(args, query, cfg, category)
+        except NotFound as e:
+            if not interactive:
+                sys.exit(str(e))
+            print(f"{e} Try another name (Enter to quit).")
 
-    kind = args.type or list(ART_TYPES)[choose("What art do you want?", list(ART_TYPES.values()), auto=args.yes)]
-    orient = args.orient
-    if kind in ("clean", "logo") and not orient:
-        orient = ["landscape", "portrait"][choose("Portrait or landscape?", ["Landscape", "Portrait"], auto=args.yes)]
 
-    if kind == "ach":
-        if platform not in (None, "Microsoft Xbox 360"):
+def game_main(args, query, cfg):
+    db = open_index(args.update)
+    platform = resolve_platform(db, args.platform)
+    if args.type == "ach":
+        if platform not in (None, XBOX360):
             sys.exit("Achievement icons are only for Xbox 360 games (platform x360).")
-        platform = "Microsoft Xbox 360"
-    games = search_games(db, query, platform, kind)
-    if not games:
-        where = f" on {platform}" if platform else ""
-        sys.exit(f"No {ART_TYPES[kind].lower()} found for \"{query}\"{where}. Try a shorter or different name.")
-    gid, title, plat = games[choose("Which game?", [f"{n}  [{pl}]" for _, n, pl in games], auto=args.yes)]
+        platform = XBOX360
 
-    if kind == "ach":
-        return download_achievements(title, plat, args, cfg)
-    print(f"Finding art for {title} [{plat}]...")
-    options = gather(db, gid, title, plat, kind, orient)
-    if not options:
-        sys.exit(f"{title} has no {ART_TYPES[kind].lower()}" + (f" in {orient}" if orient else "") + ".")
+    groups = group_games(search_games(db, query, platform, args.type))
+    if not groups:
+        what = ART_TYPES[args.type].lower() if args.type else "game"
+        where = f" on {platform}" if platform else ""
+        raise NotFound(f'No {what} found for "{query}"{where}. Try a shorter or different name.')
+    group = groups[choose("Which game?", [group_label(g) for g in groups], auto=args.yes)]
+    gid, title, plat, _, _ = group[choose(f"Which platform is {group[0][1]} on?",
+                                          [platform_label(g) for g in group], auto=args.yes)]
+
+    kinds = [k for k in ART_TYPES if k != "ach" or plat == XBOX360]
+    while True:
+        kind = args.type or kinds[choose("What art do you want?", [ART_TYPES[k] for k in kinds], auto=args.yes)]
+        orient = args.orient
+        if kind in ("clean", "logo") and not orient:
+            orient = ["landscape", "portrait"][choose("Portrait or landscape?", ["Landscape", "Portrait"],
+                                                      auto=args.yes)]
+        if kind == "ach":
+            return download_achievements(title, plat, args, cfg)
+        print(f"Finding art for {title} [{plat}]...")
+        options = gather(db, gid, title, plat, kind, orient)
+        if options:
+            break
+        missing = f"{title} has no {ART_TYPES[kind].lower()}" + (f" in {orient}" if orient else "") + "."
+        if args.type or args.yes:
+            sys.exit(missing)
+        print(f"{missing} Pick another kind.")
     tag = {"box": "box art", "clean": "key art", "logo": "key art (logo)", "icon": "icon"}[kind]
     # Store lookups guess URLs, so for icons drop the ones that didn't resolve to a real image.
     finish(options, f"{title} [{plat}] - {tag}", args, cfg, require_size=kind == "icon")
