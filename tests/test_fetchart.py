@@ -216,6 +216,47 @@ class Steam(unittest.TestCase):
             self.assertEqual([(d.name, who) for d, who in fa.steam_accounts(root)], [("222", "Sam"), ("111", "111")])
 
 
+class Wallpaper(unittest.TestCase):
+    """set_wallpaper and undo_wallpaper against a pretend desktop, so the real one is never touched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        tmp = Path(self.tmp.name)
+        self.saved = {name: getattr(fa, name) for name in ("wallpaper_state", "apply_wallpaper", "DATA_DIR", "CONFIG")}
+        fa.DATA_DIR, fa.CONFIG = tmp / "data", tmp / "config.json"
+        self.original = tmp / "my photo.jpg"
+        self.original.write_bytes(b"photo")
+        self.desktop = {"path": str(self.original), "style": "6", "tile": "0"}
+        fa.wallpaper_state = lambda: dict(self.desktop)
+        fa.apply_wallpaper = lambda state: self.desktop.clear() or self.desktop.update(state) or True
+        self.art = []
+        for name in ("halo.jpg", "elden ring.jpg"):
+            (tmp / name).write_bytes(b"art")
+            self.art.append(tmp / name)
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(fa, name, value)
+        self.tmp.cleanup()
+
+    def test_undo_after_two_wallpapers(self):
+        cfg = {}
+        fa.set_wallpaper(self.art[0], cfg)
+        fa.set_wallpaper(self.art[1], cfg)
+        self.assertEqual(Path(self.desktop["path"]).name, "elden ring.jpg")
+        fa.undo_wallpaper(cfg)
+        self.assertEqual(self.desktop, {"path": str(self.original), "style": "6", "tile": "0"})
+        with self.assertRaises(SystemExit):  # nothing left to undo
+            fa.undo_wallpaper(cfg)
+
+    def test_undo_uses_the_copy_when_the_photo_is_gone(self):
+        cfg = {}
+        fa.set_wallpaper(self.art[0], cfg)
+        self.original.unlink()
+        fa.undo_wallpaper(cfg)
+        self.assertEqual(Path(self.desktop["path"]).read_bytes(), b"photo")
+
+
 class Exophase(unittest.TestCase):
     XBOX = """<ul><li class="award"><img class="award-image trophy-image" src="https://m.exophase.com/xbox/awards/s/ab1.png?v=1">
         <div class="award-title"><a href="#">Landfall</a></div><div class="award-description"><p>Finish &amp; win</p></div>

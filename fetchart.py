@@ -6,6 +6,7 @@ Usage:
     fetchart --folder DIR [platform] [-t TYPE] [-o FOLDER] [-y]   art for every ROM in a folder
     fetchart --folder DIR movie|tv [-y]                           posters for a folder of movies or shows
     fetchart --steam [STEAM_DIR] [-y]                             Steam library art for non-Steam games
+    fetchart --undo-wallpaper    put back the wallpaper from before -w
     fetchart --update            re-download the game database
 
 Art types:
@@ -59,7 +60,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 UA = {"User-Agent": f"fetchart/{__version__} (+https://github.com/SamuelArther/fetchart)"}
 LB_DUMP = "https://gamesdb.launchbox-app.com/Metadata.zip"
@@ -2055,6 +2056,8 @@ def main():
     p.add_argument("-o", "--out", help="folder to save into")
     p.add_argument("-y", "--yes", action="store_true", help="take the top match and defaults, no prompts")
     p.add_argument("-w", "--wallpaper", action="store_true", help="set the picture as your desktop wallpaper")
+    p.add_argument("--undo-wallpaper", action="store_true",
+                   help="put back the wallpaper you had before fetchart changed it")
     p.add_argument("-f", "--folder", help="get art for every game in this folder, named after each ROM file "
                                           "(or posters for a folder of movies and shows)")
     p.add_argument("--steam", nargs="?", const="", metavar="STEAM_DIR",
@@ -2062,6 +2065,8 @@ def main():
     p.add_argument("--update", action="store_true", help="re-download the game database")
     p.add_argument("--version", action="version", version=f"fetchart {__version__}")
     args = p.parse_args()
+    if args.undo_wallpaper:
+        return undo_wallpaper(load_config())
     if args.steam is not None:
         return steam_main(args, args.steam)
     if args.folder:
@@ -2182,45 +2187,136 @@ def finish(options, name_prefix, args, cfg, require_size=False):
         saved.append(dest)
         print(f"Saved {dest}  ({len(data) // 1024} KB)")
     if args.wallpaper and saved:
-        if set_wallpaper(saved[0]):
-            print("It's your desktop wallpaper now.")
+        if set_wallpaper(saved[0], cfg):
+            print("It's your desktop wallpaper now. To put your old one back: fetchart --undo-wallpaper")
         else:
             print("Couldn't set the wallpaper on this system, but the picture is saved.")
 
 
-def set_wallpaper(path):
-    """Make a picture the desktop background. Returns False when the system isn't supported."""
+# ---------------------------------------------------------------- wallpaper
+
+def run_quiet(cmd):
+    """A command's output, or None if it failed or isn't installed."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def wallpaper_state():
+    """The desktop background right now, in the form apply_wallpaper() takes, or None if it can't be read."""
+    if os.name == "nt":
+        import ctypes
+        import winreg
+        buf = ctypes.create_unicode_buffer(1024)
+        if not ctypes.windll.user32.SystemParametersInfoW(0x73, len(buf), buf, 0):  # SPI_GETDESKWALLPAPER
+            return None
+        state = {"path": buf.value}  # "" for a plain colour
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop") as key:
+                state["style"] = winreg.QueryValueEx(key, "WallpaperStyle")[0]
+                state["tile"] = winreg.QueryValueEx(key, "TileWallpaper")[0]
+        except OSError:
+            pass
+        return state
+    if sys.platform == "darwin":
+        path = run_quiet(["osascript", "-e", 'tell application "System Events" to get picture of current desktop'])
+        return {"path": path} if path else None
+    uri = run_quiet(["gsettings", "get", "org.gnome.desktop.background", "picture-uri"])
+    if uri:
+        dark = run_quiet(["gsettings", "get", "org.gnome.desktop.background", "picture-uri-dark"]) or uri
+        return {"uri": uri.strip("'"), "uri_dark": dark.strip("'")}
+    return None  # KDE and Xfce can be set but not read back
+
+
+def apply_wallpaper(state):
+    """Set the desktop background from a wallpaper_state()-style dict. Returns False if nothing worked."""
+    if os.name == "nt":
+        import ctypes
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop", 0, winreg.KEY_SET_VALUE) as key:
+            for name, value in (("WallpaperStyle", state.get("style")), ("TileWallpaper", state.get("tile"))):
+                if value is not None:
+                    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        # SPI_SETDESKWALLPAPER, saved to the profile and announced to running programs
+        return bool(ctypes.windll.user32.SystemParametersInfoW(20, 0, state["path"], 3))
+    commands = []
+    if sys.platform == "darwin":
+        commands.append(["osascript", "-e", 'tell application "System Events" to tell every desktop to '
+                                            f'set picture to {json.dumps(state["path"])}'])
+    else:
+        if "uri" in state:
+            commands += [["gsettings", "set", "org.gnome.desktop.background", "picture-uri", state["uri"]],
+                         ["gsettings", "set", "org.gnome.desktop.background", "picture-uri-dark", state["uri_dark"]]]
+        if "path" in state:
+            commands += [["plasma-apply-wallpaperimage", state["path"]],
+                         ["xfconf-query", "-c", "xfce4-desktop", "-p",
+                          "/backdrop/screen0/monitor0/workspace0/last-image", "-s", state["path"]]]
+    return any([run_quiet(cmd) is not None for cmd in commands])
+
+
+def wallpaper_file(state):
+    """The picture file behind a wallpaper state, or None."""
+    if state.get("uri", "").startswith("file:"):
+        return Path(urllib.request.url2pathname(urllib.parse.urlparse(state["uri"]).path))
+    return Path(state["path"]) if state.get("path") else None
+
+
+def set_wallpaper(path, cfg):
+    """Make a picture the desktop background, first remembering the current one for --undo-wallpaper."""
     path = Path(path).resolve()
     if path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".bmp"):  # Windows won't take .webp
         Image, _ = pil()
         jpg = path.with_suffix(".jpg")
         Image.open(path).convert("RGB").save(jpg, quality=95)
         path = jpg
+    before = wallpaper_state()
+    # Remember what was there, unless fetchart put it there: undo goes back to the wallpaper from before
+    # fetchart, however many times -w was used since.
+    if before and before != cfg.get("wallpaper_ours"):
+        # Keep a copy of the picture. Windows shows it from a cache file that the new wallpaper replaces,
+        # and the original may get moved or deleted.
+        original = wallpaper_file(before)
+        if original and original.is_file():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            backup = DATA_DIR / ("wallpaper before fetchart" + (original.suffix or ".jpg"))
+            shutil.copyfile(original, backup)
+            before["backup"] = str(backup)
+        cfg["wallpaper_before"] = before
     if os.name == "nt":
-        import ctypes
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop", 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, "WallpaperStyle", 0, winreg.REG_SZ, "10")  # fill the screen
-            winreg.SetValueEx(key, "TileWallpaper", 0, winreg.REG_SZ, "0")
-        # SPI_SETDESKWALLPAPER, saved to the profile and announced to running programs
-        return bool(ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3))
-    if sys.platform == "darwin":
-        script = f'tell application "System Events" to tell every desktop to set picture to {json.dumps(str(path))}'
-        commands = [["osascript", "-e", script]]
+        state = {"path": str(path), "style": "10", "tile": "0"}  # style 10 fills the screen
+    elif sys.platform == "darwin":
+        state = {"path": str(path)}
     else:
-        uri = path.as_uri()
-        commands = [["gsettings", "set", "org.gnome.desktop.background", "picture-uri", uri],
-                    ["gsettings", "set", "org.gnome.desktop.background", "picture-uri-dark", uri],
-                    ["plasma-apply-wallpaperimage", str(path)],
-                    ["xfconf-query", "-c", "xfce4-desktop", "-p",
-                     "/backdrop/screen0/monitor0/workspace0/last-image", "-s", str(path)]]
-    worked = False
-    for cmd in commands:
-        try:
-            worked |= subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        except OSError:  # that desktop's tool isn't installed
-            continue
-    return worked
+        state = {"uri": path.as_uri(), "uri_dark": path.as_uri(), "path": str(path)}
+    if not apply_wallpaper(state):
+        return False
+    cfg["wallpaper_ours"] = wallpaper_state()
+    save_config(cfg)
+    return True
+
+
+def undo_wallpaper(cfg):
+    before = cfg.get("wallpaper_before")
+    if not before:
+        sys.exit("fetchart hasn't changed your wallpaper, so there's nothing to put back.")
+    state = dict(before)
+    backup = state.pop("backup", None)
+    original = wallpaper_file(state)
+    # Use the original file if it's still there, else the copy. Windows' cache file holds fetchart's picture now.
+    if backup and Path(backup).is_file() and (original is None or not original.is_file()
+                                              or original.name == "TranscodedWallpaper"):
+        if "uri" in state:
+            state["uri"] = state["uri_dark"] = Path(backup).as_uri()
+        else:
+            state["path"] = backup
+    if not apply_wallpaper(state):
+        sys.exit("Couldn't change the wallpaper back on this system.")
+    cfg.pop("wallpaper_before")
+    cfg.pop("wallpaper_ours", None)
+    save_config(cfg)
+    print("Your old wallpaper is back.")
 
 
 def run():

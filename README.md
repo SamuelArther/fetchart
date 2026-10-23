@@ -68,6 +68,8 @@ fetchart "the starry night" painting -w
 
 For games it uses landscape key art without the logo (`-t logo` keeps the logo). For paintings it uses a 4K copy instead of the giant museum scan.
 
+To go back to the wallpaper you had before, run `fetchart --undo-wallpaper`, even after several `-w` runs. fetchart keeps a copy of your old picture, so it works even if the original file is gone. A Windows slideshow or Spotlight comes back as the single picture that was showing.
+
 ## Install
 
 ### Windows, macOS, Linux: standalone download
@@ -118,6 +120,7 @@ Short names work too: `mw2`, `bo2`, `botw`, `oot`, `gta5`, `ff7`, `csgo`, `ssbm`
 | `-o FOLDER` | Where to save |
 | `-y` | No prompts: take the top match and the best image |
 | `-w` | Set the picture as your desktop wallpaper |
+| `--undo-wallpaper` | Put back the wallpaper you had before |
 | `-f FOLDER` | Get art for every game, movie or show in a folder (see above) |
 | `--steam` | Fill in Steam's library art for your non-Steam games (see above) |
 | `--update` | Re-download the game database |
