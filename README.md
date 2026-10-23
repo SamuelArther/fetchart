@@ -4,38 +4,31 @@ Find and download game art, movie and TV posters, album covers and paintings fro
 
 For games, it covers about 190,000 titles on every platform: box covers, key art (with or without the logo), console dashboard tiles, and every Xbox 360 achievement icon.
 
-Just type `fetchart` in PowerShell, Command Prompt or any terminal:
+![fetchart finding the Xbox 360 box art for Modern Warfare 2](docs/demo.gif)
+
+Just type `fetchart` in PowerShell, Command Prompt or any terminal, and pick what you're looking for: a video game, a movie or TV show, music, a painting, or a whole folder of games.
+
+Type the name, then pick the right one from the matches. Each game appears once, and you pick the platform after it. Then pick the kind of art, choose from every image found (biggest first), and pick a folder. For key art, also pick portrait or landscape. fetchart remembers the last folder you used.
+
+**Controls:** use the arrow keys or click with the mouse, and press Enter. Typing a number jumps to it. On the image and achievement lists, press **P** to see every option as a numbered picture in your browser. For achievements, Space (or a click) ticks as many as you want, and A ticks them all. Mouse clicks work in the Windows console; on macOS and Linux, use the keys.
+
+### A whole folder of games
+
+![fetchart getting box art for a folder of N64 games](docs/folder.gif)
+
+Point fetchart at a folder of ROMs and it gets art for every game, saved under each ROM's own file name, as EmulationStation, RetroArch and other frontends expect:
 
 ```
-What are you looking for?
-  1) Video game
-  2) Movie or TV show
-  3) Music (album cover)
-  4) Painting / real art
+fetchart --folder D:\ROMs\N64
 ```
 
-Type the name, then pick the right one from the matches. Each game appears once, and you pick the platform after it:
+- It reads No-Intro and Redump style names: `Legend of Zelda, The - Ocarina of Time (USA) (Rev 1).z64` is The Legend of Zelda: Ocarina of Time.
+- The system comes from the file extension or the folder's name (`N64`, `snes`, `PS2`, `Sega Genesis`...). You can also give it: `fetchart --folder D:\ROMs\Discs ps1`.
+- A `(Europe)` ROM gets the European box when there is one.
+- Games that already have art are skipped, so running it again only fills the gaps.
+- If a name isn't a sure match, fetchart asks you to pick the right game at the end, or skips it with `-y`.
 
-```
-Which game?
-  1) DOOM  [23 platforms]
-  2) DOOM 3  [7 platforms]
-  ...
-Which platform is DOOM on?
-  1) Windows (2016)
-  2) MS-DOS (1993)
-  3) Super Nintendo Entertainment System (1995)
-  ...
-What art do you want?
-  1) Box cover art (the retail cover, rating and all)
-  2) Key art, no logo
-  3) Key art, with logo
-  4) Dashboard icon / tile (the square on the console menu)
-```
-
-For key art, also pick portrait or landscape. Then choose from a list of every image found, biggest first, and pick a folder. fetchart remembers the last folder you used.
-
-Move through the menus with the arrow keys and press Enter, or type a number to jump to it. On the image and achievement lists, press **P** to see every option as a numbered picture in your browser. For achievements, Space ticks as many as you want and A ticks them all.
+The art goes in a `covers` folder inside the ROM folder (or `fanart`, `keyart`, `icons` for the other kinds); `-o` picks another.
 
 ## Install
 
@@ -86,6 +79,7 @@ Short names work too: `mw2`, `bo2`, `botw`, `oot`, `gta5`, `ff7`, `csgo`, `ssbm`
 | `-q low\|medium\|high\|all\|1920x1080` | Skip the "which one" menu |
 | `-o FOLDER` | Where to save |
 | `-y` | No prompts: take the top match and the best image |
+| `-f FOLDER` | Get art for every game in a folder (see above) |
 | `--update` | Re-download the game database |
 
 ### Examples

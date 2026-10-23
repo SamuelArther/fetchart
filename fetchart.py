@@ -3,6 +3,7 @@
 Usage:
     fetchart                     menus for everything: category, name, platform, art, folder
     fetchart <game> [platform] [-t box|clean|logo|icon|ach] [-r portrait|landscape] [-q QUALITY] [-o FOLDER] [-y]
+    fetchart --folder DIR [platform] [-t TYPE] [-o FOLDER] [-y]   art for every ROM in a folder
     fetchart --update            re-download the game database
 
 Art types:
@@ -38,6 +39,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -49,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 UA = {"User-Agent": f"fetchart/{__version__} (+https://github.com/SamuelArther/fetchart)"}
 LB_DUMP = "https://gamesdb.launchbox-app.com/Metadata.zip"
@@ -230,14 +232,86 @@ def enable_ansi():
             kernel.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
 
 
-def read_key():
-    """One keypress: up, down, pgup, pgdn, home, end, enter, space, esc, ctrl-c, or the character typed."""
-    if os.name == "nt":
-        import msvcrt
-        ch = msvcrt.getwch()
-        if ch in ("\x00", "\xe0"):
-            return {"H": "up", "P": "down", "I": "pgup", "Q": "pgdn", "G": "home", "O": "end"}.get(msvcrt.getwch(), "")
-    else:
+class WinConsole:
+    """Raw Windows console input, so menus get mouse clicks and the scroll wheel as well as keys."""
+    VK = {0x26: "up", 0x28: "down", 0x21: "pgup", 0x22: "pgdn", 0x24: "home", 0x23: "end",
+          0x0D: "enter", 0x1B: "esc", 0x20: "space"}
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes as w
+
+        class KEY(ctypes.Structure):
+            _fields_ = [("down", w.BOOL), ("repeat", w.WORD), ("vk", w.WORD), ("scan", w.WORD),
+                        ("char", w.WCHAR), ("state", w.DWORD)]
+
+        class MOUSE(ctypes.Structure):
+            _fields_ = [("x", w.SHORT), ("y", w.SHORT), ("buttons", w.DWORD), ("state", w.DWORD), ("flags", w.DWORD)]
+
+        class EVENT(ctypes.Union):
+            _fields_ = [("key", KEY), ("mouse", MOUSE), ("pad", w.BYTE * 16)]
+
+        class RECORD(ctypes.Structure):
+            _fields_ = [("type", w.WORD), ("event", EVENT)]
+
+        class INFO(ctypes.Structure):
+            _fields_ = [("size", w.SHORT * 2), ("cursor", w.SHORT * 2), ("attr", w.WORD),
+                        ("window", w.SHORT * 4), ("max", w.SHORT * 2)]
+
+        self.ctypes, self.w, self.RECORD, self.INFO = ctypes, w, RECORD, INFO
+        self.kernel = ctypes.windll.kernel32
+        self.stdin, self.stdout = self.kernel.GetStdHandle(-10), self.kernel.GetStdHandle(-11)
+        self.saved = w.DWORD()
+        self.kernel.GetConsoleMode(self.stdin, ctypes.byref(self.saved))
+
+    def __enter__(self):
+        # Mouse input on, quick-edit (which swallows clicks) and Ctrl+C-as-signal off while the menu is up.
+        mode = (self.saved.value | 0x0010 | 0x0080) & ~0x0040 & ~0x0001 & ~0x0200
+        self.kernel.SetConsoleMode(self.stdin, mode)
+        return self
+
+    def __exit__(self, *_):
+        self.kernel.SetConsoleMode(self.stdin, self.saved)
+
+    def cursor_row(self):
+        info = self.INFO()
+        self.kernel.GetConsoleScreenBufferInfo(self.stdout, self.ctypes.byref(info))
+        return info.cursor[1]
+
+    def read(self):
+        """Like read_key, plus ("click", row) and wheelup / wheeldown."""
+        rec, count = self.RECORD(), self.w.DWORD()
+        while True:
+            self.kernel.ReadConsoleInputW(self.stdin, self.ctypes.byref(rec), 1, self.ctypes.byref(count))
+            if rec.type == 1 and rec.event.key.down:  # KEY_EVENT
+                key = rec.event.key
+                if key.vk in self.VK:
+                    return self.VK[key.vk]
+                if key.char == "\x03":
+                    return "ctrl-c"
+                if key.char and key.char != "\0":
+                    return key.char
+            elif rec.type == 2:  # MOUSE_EVENT
+                m = rec.event.mouse
+                if m.flags == 4:  # MOUSE_WHEELED: the high word of the button state is the direction
+                    return "wheelup" if m.buttons & 0x80000000 == 0 else "wheeldown"
+                if m.flags in (0, 2) and m.buttons & 1:  # left button pressed, or double-clicked
+                    return ("click", m.y)
+
+
+class PosixKeys:
+    """Keyboard input for the menus on macOS and Linux."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    def cursor_row(self):
+        return None  # no mouse support here, so the menu doesn't need to know where it is
+
+    def read(self):
         import select
         import termios
         import tty
@@ -251,64 +325,81 @@ def read_key():
                         "OH": "home", "OF": "end"}.get(os.read(fd, 8).decode(errors="ignore"), "")
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-    return {"\r": "enter", "\n": "enter", " ": "space", "\x1b": "esc", "\x03": "ctrl-c"}.get(ch, ch)
+        return {"\r": "enter", "\n": "enter", " ": "space", "\x1b": "esc", "\x03": "ctrl-c"}.get(ch, ch)
+
+
+def menu_input():
+    return WinConsole() if os.name == "nt" else PosixKeys()
 
 
 def arrow_menu(title, rows, default=0, multi=False, preview=None):
-    """Menu driven by the arrow keys (typing a number jumps to it). Returns the picked row index,
-    or with multi=True the ticked indexes (just the highlighted row if none are ticked)."""
+    """Menu driven by the arrow keys or the mouse (typing a number jumps to it). Returns the picked row
+    index, or with multi=True the ticked indexes (just the highlighted row if none are ticked)."""
     enable_ansi()
     n, cols = len(rows), shutil.get_terminal_size().columns
     height = max(3, min(n, shutil.get_terminal_size().lines - 5))
     width = len(str(n))
-    keys = ("Up/Down move, Enter " + ("done, Space tick, A all" if multi else "pick")
-            + (", P preview in browser" if preview else "") + ", Esc quit")
     cur, top, ticked, typed, note, drawn = default, 0, set(), "", "", 0
     print()
     sys.stdout.write("\x1b[?25l")  # hide the cursor while the menu is up
     try:
-        while True:
-            top = min(max(top, cur - height + 1), cur)
-            out = [(title + (f"  ({cur + 1} of {n})" if n > height else ""))[:cols - 1]]
-            for i in range(top, top + height):
-                box = ("[x] " if i in ticked else "[ ] ") if multi else ""
-                text = f"{'>' if i == cur else ' '} {i + 1:>{width}}) {box}{rows[i]}"[:cols - 1]
-                out.append(f"\x1b[7m{text}\x1b[0m" if i == cur else text)
-            out.append(f"\x1b[2m{(note or keys)[:cols - 1]}\x1b[0m")
-            sys.stdout.write((f"\x1b[{drawn}F\x1b[J" if drawn else "") + "\n".join(out) + "\n")
-            sys.stdout.flush()
-            drawn, note = len(out), ""
+        with menu_input() as keyboard:
+            clicks = keyboard.cursor_row() is not None
+            keys = ("Up/Down" + (" or click" if clicks else "") + ", Enter "
+                    + ("done, Space tick, A all" if multi else "pick")
+                    + (", P preview in browser" if preview else "") + ", Esc quit")
+            while True:
+                top = min(max(top, cur - height + 1), cur)
+                out = [(title + (f"  ({cur + 1} of {n})" if n > height else ""))[:cols - 1]]
+                for i in range(top, top + height):
+                    box = ("[x] " if i in ticked else "[ ] ") if multi else ""
+                    text = f"{'>' if i == cur else ' '} {i + 1:>{width}}) {box}{rows[i]}"[:cols - 1]
+                    out.append(f"\x1b[7m{text}\x1b[0m" if i == cur else text)
+                out.append(f"\x1b[2m{(note or keys)[:cols - 1]}\x1b[0m")
+                sys.stdout.write((f"\x1b[{drawn}F\x1b[J" if drawn else "") + "\n".join(out) + "\n")
+                sys.stdout.flush()
+                drawn, note = len(out), ""
+                first_row = keyboard.cursor_row() - drawn + 1 if clicks else 0
 
-            key = read_key()
-            typed = typed + key if key.isdigit() else ""
-            if key.isdigit():
-                if not 1 <= int(typed) <= n:
-                    typed = key
-                if 1 <= int(typed) <= n:
-                    cur = int(typed) - 1
-            elif key == "up":
-                cur = (cur - 1) % n
-            elif key == "down":
-                cur = (cur + 1) % n
-            elif key in ("pgup", "pgdn"):
-                cur = max(0, cur - height) if key == "pgup" else min(n - 1, cur + height)
-            elif key in ("home", "end"):
-                cur = 0 if key == "home" else n - 1
-            elif key == "space" and multi:
-                ticked ^= {cur}
-            elif key.lower() == "a" and multi:
-                ticked = set() if len(ticked) == n else set(range(n))
-            elif key.lower() == "p" and preview:
-                preview()
-                note = "Preview opened in your browser."
-            elif key in ("esc", "ctrl-c"):
-                sys.stdout.write("\x1b[?25h\n")
-                sys.exit(1)
-            elif key == "enter":
-                picked = (sorted(ticked) or [cur]) if multi else cur
-                summary = (rows[cur] if not multi or picked == [cur] else f"{len(picked)} picked")
-                sys.stdout.write(f"\x1b[{drawn}F\x1b[J" + f"{title} {summary}"[:cols - 1] + "\n")
-                return picked
+                key = keyboard.read()
+                if isinstance(key, tuple):  # ("click", screen row)
+                    row = key[1] - first_row
+                    if not 0 <= row < height:
+                        continue
+                    cur = top + row
+                    if multi:
+                        ticked ^= {cur}
+                        continue
+                    key = "enter"
+                typed = typed + key if key.isdigit() else ""
+                if key.isdigit():
+                    if not 1 <= int(typed) <= n:
+                        typed = key
+                    if 1 <= int(typed) <= n:
+                        cur = int(typed) - 1
+                elif key in ("up", "down"):
+                    cur = (cur + (1 if key == "down" else -1)) % n
+                elif key in ("wheelup", "wheeldown"):
+                    cur = max(0, cur - 3) if key == "wheelup" else min(n - 1, cur + 3)
+                elif key in ("pgup", "pgdn"):
+                    cur = max(0, cur - height) if key == "pgup" else min(n - 1, cur + height)
+                elif key in ("home", "end"):
+                    cur = 0 if key == "home" else n - 1
+                elif key == "space" and multi:
+                    ticked ^= {cur}
+                elif key.lower() == "a" and multi:
+                    ticked = set() if len(ticked) == n else set(range(n))
+                elif key.lower() == "p" and preview:
+                    preview()
+                    note = "Preview opened in your browser."
+                elif key in ("esc", "ctrl-c"):
+                    sys.stdout.write("\x1b[?25h\n")
+                    sys.exit(1)
+                elif key == "enter":
+                    picked = (sorted(ticked) or [cur]) if multi else cur
+                    summary = rows[cur] if not multi or picked == [cur] else f"{len(picked)} picked"
+                    sys.stdout.write(f"\x1b[{drawn}F\x1b[J" + f"{title} {summary}"[:cols - 1] + "\n")
+                    return picked
     finally:
         sys.stdout.write("\x1b[?25h")
         sys.stdout.flush()
@@ -483,22 +574,27 @@ def open_index(force_update=False):
     return sqlite3.connect(DB_PATH)
 
 
-def resolve_platform(db, text):
-    if not text or text.lower() in ("all", "any"):
-        return None
+def match_platform(db, text, threshold=0.45):
+    """LaunchBox platform name for a short name ("n64") or a near-full one ("Nintendo 64"), or None."""
     key = re.sub(r"[^a-z0-9]", "", text.lower())
     if key in PLATFORMS:
         return PLATFORMS[key]
     platforms = [row[0] for row in db.execute("SELECT DISTINCT platform FROM games")]
     ranked = sorted(platforms, key=lambda p: -score(text, p))
-    if ranked and score(text, ranked[0]) > 0.45:
-        return ranked[0]
-    sys.exit(f"Don't know the platform '{text}'. Try: pc, xbox, x360, ps2, n64, gc, wii, switch, gba, snes...")
+    return ranked[0] if ranked and score(text, ranked[0]) > threshold else None
+
+
+def resolve_platform(db, text):
+    if not text or text.lower() in ("all", "any"):
+        return None
+    return match_platform(db, text) or sys.exit(
+        f"Don't know the platform '{text}'. Try: pc, xbox, x360, ps2, n64, gc, wii, switch, gba, snes...")
 
 
 def search_games(db, query, platform, kind):
     """Best-matching games that have art of the wanted kind (any game if kind is None),
-    best first: [(id, name, platform, year, votes)]."""
+    best first: [(id, name, platform, year, votes, match)]. match is how well the name itself matched
+    (1.3 = exactly), before the popularity and year bonuses that decide the order."""
     core, wanted_year = split_year(query)
     words = sorted(norm(core).split(), key=len, reverse=True)
     if not words:
@@ -530,9 +626,9 @@ def search_games(db, query, platform, kind):
         s = (max(text + min(0.2, fame * 0.07), short_form + min(0.75, fame * 0.25))
              + (0.1 if alias == name else 0) + (0.3 if wanted_year and year == wanted_year else 0))
         if s > best.get(gid, (0,))[0]:
-            best[gid] = (s, name, plat, year, votes)
+            best[gid] = (s, name, plat, year, votes, max(text, short_form))
     ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
-    return [(gid, name, plat, year, votes) for gid, (s, name, plat, year, votes) in ranked if s > 0.35]
+    return [(gid, *rest) for gid, (s, *rest) in ranked if s > 0.35]
 
 
 def group_games(games, year=None, limit=12):
@@ -982,6 +1078,7 @@ CATEGORIES = {
     "screen": ("Movie or TV show", "Movie or show name: "),
     "album": ("Music (album cover)", "Album (artist + album name works best): "),
     "painting": ("Painting / real art", "Painting name (add the artist if you know it): "),
+    "folder": ("A whole folder of games (art for every ROM)", "Folder with your games (paste its path): "),
 }
 TV_TYPES = {"tvSeries", "tvMiniSeries"}
 
@@ -1140,6 +1237,209 @@ def painting_main(args, query, cfg):
     finish(options, f"{page['title']} - {page.get('description') or 'artwork'}", args, cfg, require_size=True)
 
 
+# ---------------------------------------------------------------- whole folders of games
+
+# File extensions that only one system uses -> LaunchBox platform names. Disc images (.iso, .chd, .cue)
+# and archives (.zip, .7z) could be anything, so those rely on the folder name or the platform given.
+EXT_PLATFORMS = {
+    ".nes": "Nintendo Entertainment System", ".unf": "Nintendo Entertainment System",
+    ".fds": "Nintendo Famicom Disk System",
+    ".sfc": "Super Nintendo Entertainment System", ".smc": "Super Nintendo Entertainment System",
+    ".n64": "Nintendo 64", ".z64": "Nintendo 64", ".v64": "Nintendo 64", ".ndd": "Nintendo 64DD",
+    ".gb": "Nintendo Game Boy", ".gbc": "Nintendo Game Boy Color", ".gba": "Nintendo Game Boy Advance",
+    ".nds": "Nintendo DS", ".3ds": "Nintendo 3DS", ".cci": "Nintendo 3DS", ".cia": "Nintendo 3DS",
+    ".gcm": "Nintendo GameCube", ".wbfs": "Nintendo Wii",
+    ".wud": "Nintendo Wii U", ".wux": "Nintendo Wii U", ".wua": "Nintendo Wii U",
+    ".nsp": "Nintendo Switch", ".xci": "Nintendo Switch", ".nsz": "Nintendo Switch", ".xcz": "Nintendo Switch",
+    ".vb": "Nintendo Virtual Boy",
+    ".gen": "Sega Genesis", ".smd": "Sega Genesis", ".sms": "Sega Master System", ".gg": "Sega Game Gear",
+    ".32x": "Sega 32X", ".gdi": "Sega Dreamcast", ".cdi": "Sega Dreamcast",
+    ".pce": "NEC TurboGrafx-16", ".a26": "Atari 2600", ".a52": "Atari 5200", ".a78": "Atari 7800",
+    ".lnx": "Atari Lynx", ".j64": "Atari Jaguar",
+    ".ngp": "SNK Neo Geo Pocket", ".ngc": "SNK Neo Geo Pocket Color",
+    ".ws": "WonderSwan", ".wsc": "WonderSwan Color",
+    ".cso": "Sony PSP", ".pbp": "Sony PSP", ".vpk": "Sony Playstation Vita",
+}
+NOT_GAMES = {".txt", ".nfo", ".diz", ".pdf", ".htm", ".html", ".url", ".lnk", ".ini", ".cfg", ".json", ".xml",
+             ".dat", ".db", ".log", ".md5", ".sha1", ".sfv", ".crc", ".jpg", ".jpeg", ".png", ".gif", ".bmp",
+             ".webp", ".ico", ".mp3", ".ogg", ".wav", ".flac", ".mp4", ".mkv", ".sav", ".srm", ".state", ".mcr",
+             ".ips", ".bps", ".ups", ".xdelta", ".ppf", ".exe", ".dll", ".bat", ".sh", ".py"}
+REGION_TAGS = {"usa": "North America", "us": "North America", "world": "World", "europe": "Europe",
+               "eu": "Europe", "uk": "United Kingdom", "japan": "Japan", "jp": "Japan", "australia": "Australia",
+               "canada": "Canada", "germany": "Germany", "france": "France", "spain": "Spain", "italy": "Italy",
+               "korea": "Korea", "brazil": "Brazil"}
+FOLDER_SUBDIRS = {"box": "covers", "clean": "fanart", "logo": "keyart", "icon": "icons"}
+SURE_MATCH = 1.0  # name match needed to save without asking (1.3 = exactly the same name)
+
+
+def rom_title(stem):
+    """The game's name from a ROM file name:
+    "Legend of Zelda, The - Ocarina of Time (USA) (Rev 1)" -> "The Legend of Zelda - Ocarina of Time"."""
+    name = re.sub(r"\s*[(\[][^)\]]*[)\]]", "", stem).replace("_", " ")
+    if " " not in name:
+        name = name.replace(".", " ")
+    name = re.sub(r"\s+", " ", name).strip(" -.")
+    # No-Intro moves a leading article to the end of the first part of the name.
+    return re.sub(r"^(.*?), (The|A|An)\b(.*)$", r"\2 \1\3", name) or stem
+
+
+def rom_region(stem):
+    """The region in a ROM file name's tags ("(USA, Europe)" -> "North America"), or None."""
+    for tag in re.findall(r"\(([^)]*)\)", stem):
+        for part in re.split(r",\s*", tag.lower()):
+            if part in REGION_TAGS:
+                return REGION_TAGS[part]
+    return None
+
+
+def scan_folder(folder):
+    """The games in a folder: [(file name without extension, platform implied by the extension or None)]."""
+    files = sorted(f for f in folder.iterdir() if f.is_file() and not f.name.startswith("."))
+    cues = {f.stem.lower() for f in files if f.suffix.lower() == ".cue"}
+    games = []
+    for f in files:
+        ext = f.suffix.lower()
+        if ext in NOT_GAMES or f.stem.lower().startswith("readme"):
+            continue
+        if ext == ".bin" and (f.stem.lower() in cues or re.search(r"\(track \d+\)", f.stem, re.I)):
+            continue  # the .cue sheet stands for the whole disc
+        games.append((f.stem, EXT_PLATFORMS.get(ext)))
+    if not games:  # one folder per game, as PS3, Wii U and PC dumps are kept
+        games = [(d.name, None) for d in sorted(folder.iterdir()) if d.is_dir() and not d.name.startswith(".")]
+    return games
+
+
+def fetch_best(game, kind, orient, region, cache, lock):
+    """Download the best art for one game, preferring the ROM's region. Returns (bytes, ext) or None."""
+    gid, title, plat = game[:3]
+    with lock:
+        if gid in cache:  # discs 2 and 3 of the same game
+            return cache[gid]
+    db = sqlite3.connect(DB_PATH)
+    try:
+        options = gather(db, gid, title, plat, kind, orient)
+    finally:
+        db.close()
+    if region:
+        options.sort(key=lambda o: region.lower() not in o.source.lower())
+    if kind == "icon":  # store lookups guess URLs, so keep the ones that turned out to be real images
+        for o in options:
+            probe_size(o)
+        options = sorted((o for o in options if o.size), key=lambda o: -o.final_size()[0])
+    result = None
+    for art in options:
+        try:
+            result = render(art)
+            break
+        except (urllib.error.URLError, OSError):
+            continue
+    with lock:
+        cache[gid] = result
+    return result
+
+
+def folder_main(args, folder_text, cfg):
+    """Art for every game in a folder, saved under each ROM's own file name, as emulator frontends expect."""
+    folder = Path(os.path.expandvars(os.path.expanduser(folder_text.strip().strip('"').strip("'"))))
+    if not folder.is_dir():
+        raise NotFound(f"There's no folder at {folder}.")
+    games = scan_folder(folder)
+    if not games:
+        raise NotFound(f"No games in {folder}.")
+    if args.type == "ach":
+        sys.exit("Achievement icons are one game at a time: fetchart <game> x360 -t ach")
+    db = open_index(args.update)
+
+    # The system: the one given, else the folder's name ("N64", "PS2", "Sega Genesis"), else each file's extension.
+    platform = resolve_platform(db, args.platform) if args.platform else match_platform(db, folder.name, 0.8)
+    if not platform and not all(p for _, p in games) and not args.yes:
+        answer = ask("\nWhich system are these games for? (n64, snes, ps2, gc, ... Enter = work it out per game): ")
+        platform = resolve_platform(db, answer) if answer else None
+    systems = sorted({platform} if platform else {p for _, p in games if p})
+    print(f"\nFound {len(games)} games in {folder}" + (f" ({', '.join(systems)})" if systems else "") + ".")
+
+    kinds = ["box", "clean", "logo", "icon"]
+    kind = args.type or kinds[choose("What art do you want for each game?", [ART_TYPES[k] for k in kinds],
+                                     auto=args.yes)]
+    orient = args.orient
+    if kind in ("clean", "logo") and not orient:
+        orient = ["landscape", "portrait"][choose("Portrait or landscape?", ["Landscape", "Portrait"], auto=args.yes)]
+    default = folder / FOLDER_SUBDIRS[kind]
+    out = args.out or (str(default) if args.yes else ask(f"\nSave the art to which folder? [Enter = {default}]: ",
+                                                          str(default)))
+    out = Path(os.path.expandvars(os.path.expanduser(out.strip().strip('"').strip("'"))))
+    out.mkdir(parents=True, exist_ok=True)
+    have = {f.stem for f in out.iterdir() if f.is_file()}
+    print()
+
+    # Match every file first (quick, all local), then download the sure ones in parallel.
+    lookups, plan = {}, []
+    for stem, ext_platform in games:
+        title, plat = rom_title(stem), platform or ext_platform
+        key = (norm(title), plat)
+        if key not in lookups:
+            found = search_games(db, title, plat, kind)
+            if not found and plat:  # LaunchBox may file it under a sister system
+                found = search_games(db, title, None, kind)
+            lookups[key] = found[:8]
+        plan.append((stem, lookups[key]))
+
+    total, width = len(plan), len(str(len(plan)))
+    counts = {"saved": 0, "had it": 0, "unsure": 0, "no match": 0, "failed": 0}
+    unsure, lock, cache = [], threading.Lock(), {}
+
+    def report(n, status, stem, game=None):
+        counts[status] += 1
+        print(f"[{n:>{width}}/{total}] {status:<8} {stem}" + (f"  ->  {game[1]} [{game[2]}]" if game else ""))
+
+    def save(n, stem, game):
+        result = fetch_best(game, kind, orient, rom_region(stem), cache, lock)
+        with lock:
+            if result:
+                (out / (stem + result[1])).write_bytes(result[0])
+            report(n, "saved" if result else "failed", stem, game)
+
+    with ThreadPoolExecutor(6) as pool:
+        for n, (stem, found) in enumerate(plan, 1):
+            if stem in have:
+                with lock:
+                    report(n, "had it", stem)
+            elif not found:
+                with lock:
+                    report(n, "no match", stem)
+            elif found[0][5] < SURE_MATCH:
+                unsure.append((stem, found))
+                with lock:
+                    report(n, "unsure", stem, found[0])
+            else:
+                pool.submit(save, n, stem, found[0])
+
+    were = "was" if len(unsure) == 1 else "were"
+    if unsure and not args.yes:
+        print(f"\n{len(unsure)} {were}n't a sure match. Pick the right game for each one:")
+        for i, (stem, found) in enumerate(unsure, 1):
+            labels = [f"{g[1]}  [{platform_label(g)}]" for g in found] + ["Skip this one", "Skip the rest"]
+            pick = choose(f'({i}/{len(unsure)}) Which game is "{stem}"?', labels)
+            if pick == len(found) + 1:
+                break
+            if pick < len(found):
+                counts["unsure"] -= 1
+                result = fetch_best(found[pick], kind, orient, rom_region(stem), cache, lock)
+                if result:
+                    (out / (stem + result[1])).write_bytes(result[0])
+                    counts["saved"] += 1
+                    print(f"  saved {stem}{result[1]}")
+                else:
+                    counts["failed"] += 1
+                    print(f"  couldn't download art for {found[pick][1]}")
+    elif unsure:
+        print(f"\n{len(unsure)} {were}n't a sure match, so {'it was' if len(unsure) == 1 else 'they were'} "
+              "skipped. Run without -y to pick by hand.")
+
+    print(f"\nDone: {counts['saved']} saved, {counts['had it']} already had art, {counts['unsure']} skipped, "
+          f"{counts['no match']} not found, {counts['failed']} failed.\nThe art is in {out}")
+
+
 # ---------------------------------------------------------------- main
 
 def pick_art(options, wanted, auto, heading):
@@ -1258,9 +1558,16 @@ def main():
     p.add_argument("-q", "--quality", help="low, medium, high, all, or an exact size like 1920x1080")
     p.add_argument("-o", "--out", help="folder to save into")
     p.add_argument("-y", "--yes", action="store_true", help="take the top match and defaults, no prompts")
+    p.add_argument("-f", "--folder", help="get art for every game in this folder, named after each ROM file")
     p.add_argument("--update", action="store_true", help="re-download the game database")
     p.add_argument("--version", action="version", version=f"fetchart {__version__}")
     args = p.parse_args()
+    if args.folder:
+        args.platform = args.platform or args.game  # fetchart --folder D:\ROMs n64
+        try:
+            return folder_main(args, args.folder, load_config())
+        except NotFound as e:
+            sys.exit(str(e))
     if args.update and not args.game:
         open_index(force_update=True)
         return
@@ -1279,6 +1586,8 @@ def main():
                 return
         query = re.sub(r"[-_]+", " ", args.game).strip()
         try:
+            if category == "folder":
+                return folder_main(args, args.game, cfg)
             if category == "game":
                 return game_main(args, query, cfg)
             if category == "painting":
@@ -1304,8 +1613,8 @@ def game_main(args, query, cfg):
         where = f" on {platform}" if platform else ""
         raise NotFound(f'No {what} found for "{query}"{where}. Try a shorter or different name.')
     group = groups[choose("Which game?", [group_label(g) for g in groups], auto=args.yes)]
-    gid, title, plat, _, _ = group[choose(f"Which platform is {group[0][1]} on?",
-                                          [platform_label(g) for g in group], auto=args.yes)]
+    gid, title, plat = group[choose(f"Which platform is {group[0][1]} on?",
+                                    [platform_label(g) for g in group], auto=args.yes)][:3]
 
     kinds = [k for k in ART_TYPES if k != "ach" or plat == XBOX360]
     while True:
