@@ -51,7 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 UA = {"User-Agent": f"fetchart/{__version__} (+https://github.com/SamuelArther/fetchart)"}
 LB_DUMP = "https://gamesdb.launchbox-app.com/Metadata.zip"
