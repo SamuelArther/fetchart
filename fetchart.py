@@ -810,16 +810,22 @@ def download_achievements(title, plat, args, cfg):
 def exophase_achievements(title):
     """Names of an Xbox 360 game's achievements, in the game's order, from Exophase:
     [{name, desc, points, icon}], or [] when it isn't listed."""
+    # Exophase drops edition words that XboxUnity keeps ("Minecraft: Xbox 360 Edition" is just "Minecraft").
+    short = re.sub(r"[\s:\-]*\b(for |on )?(xbox 360|x360)( edition)?\s*$", "", title, flags=re.I).strip()
     try:
-        games = get_json("https://api.exophase.com/public/archive/games", {"q": title})["games"]["list"]
-        games = [g for g in games if any(p["slug"] == "xbox-360" for p in g.get("platforms", []))]
-        # Japanese releases are listed separately; prefer the main one when the names tie.
-        games.sort(key=lambda g: "-jp-" in g.get("endpoint_awards", ""))
-        game = best_match(title, games, "title")
-        if not game:
+        for query in dict.fromkeys((title, short)):
+            found = get_json("https://api.exophase.com/public/archive/games", {"q": query}).get("games")
+            games = [g for g in (found or {}).get("list", [])
+                     if any(p["slug"] == "xbox-360" for p in g.get("platforms", []))]
+            # Japanese releases are listed separately; prefer the main one when the names tie.
+            games.sort(key=lambda g: "-jp-" in g.get("endpoint_awards", ""))
+            game = best_match(query, games, "title")
+            if game:
+                break
+        else:
             return []
         page = http_get(game["endpoint_awards"]).decode("utf-8", "replace")
-    except (urllib.error.URLError, ValueError, KeyError):
+    except (urllib.error.URLError, ValueError, KeyError, TypeError, AttributeError):
         return []
     out = []
     for block in page.split("<li ")[1:]:
