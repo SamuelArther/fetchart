@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fetchart"
+dynamic = ["version"]
+description = "Find and download game art, movie posters and album covers from the command line."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Samuel Arther" }]
+requires-python = ">=3.9"
+dependencies = ["Pillow>=9"]
+keywords = ["game art", "box art", "cover art", "xbox", "launchbox", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment",
+    "Topic :: Multimedia :: Graphics",
+]
+
+[project.urls]
+Homepage = "https://github.com/SamuelArther/fetchart"
+
+[project.scripts]
+fetchart = "fetchart:main"
+
+[tool.setuptools]
+py-modules = ["fetchart"]
+
+[tool.setuptools.dynamic]
+version = { attr = "fetchart.__version__" }
