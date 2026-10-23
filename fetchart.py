@@ -12,7 +12,9 @@ Art types:
                                                       fanart with the game's clear logo laid on top)
     icon    dashboard icon / tile                    (Xbox 360 marketplace tiles + banners, Microsoft Store
                                                       squares, Nintendo eShop icons, Steam + LaunchBox icons)
-    ach     every Xbox 360 achievement icon          (the Xbox Live image server, by title ID)
+    ach     Xbox 360 achievement icons, by name      (the Xbox Live image server, by title ID; names from Exophase)
+
+Short names work: mw2, botw, gta5, ff7, "mw2 remastered". Add a year for remakes: "mw2 2009".
 
 Movies, TV, music and paintings (use the platform word movie, tv, album or painting):
     fetchart inception movie                         posters from IMDb and Wikipedia
@@ -26,6 +28,7 @@ Its public metadata dump is downloaded once and indexed into a local SQLite file
 
 import argparse
 import difflib
+import html
 import io
 import json
 import math
@@ -56,7 +59,7 @@ DB_MAX_AGE = 30 * 86400
 
 KEEP_TYPES = {"Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front",
               "Fanart - Background", "Clear Logo", "Banner", "Poster", "Square", "Icon"}
-DB_SCHEMA = 3  # bump when KEEP_TYPES or the table layout changes, to force a rebuild
+DB_SCHEMA = 4  # bump when KEEP_TYPES or the table layout changes, to force a rebuild
 NEEDED_TYPES = {
     "box": ("Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front"),
     "clean": ("Fanart - Background",),
@@ -143,6 +146,57 @@ def score(query, name):
     return ratio * 0.5 + overlap * 0.5 + bonus
 
 
+ROMAN = {"ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7", "viii": "8", "ix": "9", "x": "10",
+         "xi": "11", "xii": "12", "xiii": "13", "xiv": "14", "xv": "15", "xvi": "16"}
+
+
+def acronyms(name):
+    """Short forms people type for a title, for the whole name and each part after a colon:
+    "Call of Duty: Modern Warfare 2" -> "codmw2 cod mw2", "Final Fantasy VII" -> "ffvii ff7".
+    Numbers stay whole; Roman numerals are kept both ways."""
+    keep = lambda w: w if any(c.isdigit() for c in w) else None
+    out = []
+    for part in [name] + re.split(r":| - ", name):
+        words = norm(part).split()
+        if not words:
+            continue
+        for numeral in (lambda w: w, lambda w: ROMAN[w]):
+            a = "".join(keep(w) or (numeral(w) if w in ROMAN and i else w[0]) for i, w in enumerate(words))
+            if a not in out:
+                out.append(a)
+    return " ".join(out)
+
+
+STOPWORDS = {"the", "of", "and", "a", "an", "to", "in", "on"}
+
+
+def acronym_score(tokens, alias_norm, abbr):
+    """How well a typed short form matches a title's acronyms ("mw2" in "codmw2"): whole, its start or
+    end, or inside it. Mixed searches like "mw2 remastered" match when every word is either part of the
+    title or part of its acronym."""
+    short = "".join(tokens)
+    best = 0.0
+    for a in abbr.split():
+        if a == short:  # the whole title, or a whole part of it ("mw2" for "...: Modern Warfare 2")
+            return 1.0
+        if a.startswith(short):
+            best = max(best, 0.95)
+        elif short in a:  # somewhere in the middle ("mw2" inside "smw2"), a weaker hint
+            best = max(best, 0.75)
+    if not best and len(tokens) > 1:
+        words = alias_norm.split()
+        in_title = [t in words for t in tokens]
+        if any(in_title) and all(hit or any(t in a for a in abbr.split()) for t, hit in zip(tokens, in_title)):
+            best = 0.9
+    return best
+
+
+def split_year(query):
+    """Pull a release year off the end of a search: "mw2 2009" -> ("mw2", 2009)."""
+    m = re.fullmatch(r"(.+?)\s+((?:19[5-9]|20[0-4])\d)", query.strip())
+    return (m[1], int(m[2])) if m else (query, None)
+
+
 def safe_filename(name):
     return re.sub(r'[<>:"/\\|?*]+', "_", name).strip(" .") or "art"
 
@@ -172,6 +226,28 @@ def choose(title, options, default=1, auto=False, allow_all=False):
             return -1
         if answer.isdigit() and 1 <= int(answer) <= len(options):
             return int(answer) - 1
+        print("  Not an option, try again.")
+
+
+def choose_many(title, options):
+    """Numbered menu where several can be picked: '3', '1,4,9', '10-20' or 'a' for all. Returns indexes."""
+    print(f"\n{title}")
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}) {opt}")
+    while True:
+        answer = ask("Pick one or more (e.g. 3 or 1,4,9 or 10-20) [Enter = all]: ", "a").lower().replace(" ", "")
+        if answer in ("a", "all"):
+            return list(range(len(options)))
+        picked = []
+        for part in answer.split(","):
+            lo, _, hi = part.partition("-")
+            if lo.isdigit() and (hi.isdigit() or not hi):
+                picked += range(int(lo), int(hi or lo) + 1)
+            else:
+                picked = []
+                break
+        if picked and all(1 <= n <= len(options) for n in picked):
+            return sorted({n - 1 for n in picked})
         print("  Not an option, try again.")
 
 
@@ -223,14 +299,14 @@ def build_index():
     db = sqlite3.connect(tmp)
     db.executescript("""
         CREATE TABLE games (id INTEGER PRIMARY KEY, name TEXT, platform TEXT, votes INTEGER, year INTEGER);
-        CREATE TABLE names (id INTEGER, name TEXT, norm TEXT);
+        CREATE TABLE names (id INTEGER, name TEXT, norm TEXT, abbr TEXT);
         CREATE TABLE images (id INTEGER, type TEXT, region TEXT, file TEXT);
     """)
     games, names, images = [], [], []
 
     def flush():
         db.executemany("INSERT OR IGNORE INTO games VALUES (?,?,?,?,?)", games)
-        db.executemany("INSERT INTO names VALUES (?,?,?)", names)
+        db.executemany("INSERT INTO names VALUES (?,?,?,?)", names)
         db.executemany("INSERT INTO images VALUES (?,?,?,?)", images)
         games.clear(), names.clear(), images.clear()
 
@@ -244,11 +320,11 @@ def build_index():
                     games.append((int(gid), name, el.findtext("Platform") or "",
                                   int(el.findtext("CommunityRatingCount") or 0),
                                   int(year) if year.isdigit() else None))
-                    names.append((int(gid), name, norm(name)))
+                    names.append((int(gid), name, norm(name), acronyms(name)))
             elif tag == "GameAlternateName":
                 gid, name = el.findtext("DatabaseID"), el.findtext("AlternateName") or ""
                 if gid and name:
-                    names.append((int(gid), name, norm(name)))
+                    names.append((int(gid), name, norm(name), acronyms(name)))
             elif tag == "GameImage":
                 kind = el.findtext("Type")
                 if kind in KEEP_TYPES and el.findtext("DatabaseID"):
@@ -304,35 +380,50 @@ def resolve_platform(db, text):
 def search_games(db, query, platform, kind):
     """Best-matching games that have art of the wanted kind (any game if kind is None),
     best first: [(id, name, platform, year, votes)]."""
-    words = sorted(norm(query).split(), key=len, reverse=True)
+    core, wanted_year = split_year(query)
+    words = sorted(norm(core).split(), key=len, reverse=True)
     if not words:
         return []
+    tokens = norm(core).split()
+    short = "".join(tokens)  # "cod mw2" -> "codmw2", checked against title acronyms
+    # In a mixed search ("mw2 remastered") the short words are looked up in the acronyms on their own.
+    abbr_parts = [short] + [t for t in tokens if len(tokens) > 1 and t not in STOPWORDS and len(t) >= 2
+                            and (len(t) <= 4 or any(c.isdigit() for c in t))]
     needed = NEEDED_TYPES[kind]
     has_art = (f"AND EXISTS (SELECT 1 FROM images i WHERE i.id = g.id AND i.type IN ({','.join('?' * len(needed))}))"
                if needed else "")
     sql = f"""
-        SELECT g.id, g.name, g.platform, g.year, g.votes, n.name FROM names n JOIN games g ON g.id = n.id
-        WHERE n.norm LIKE ? {"AND g.platform = ?" if platform else ""}
+        SELECT g.id, g.name, g.platform, g.year, g.votes, n.name, n.abbr FROM names n JOIN games g ON g.id = n.id
+        WHERE (n.norm LIKE ? OR n.norm LIKE ? {"OR n.abbr LIKE ? " * len(abbr_parts)})
+        {"AND g.platform = ?" if platform else ""}
         {has_art}
     """
-    params = [f"%{words[0]}%"] + ([platform] if platform else []) + list(needed)
+    params = ([f"%{words[0]}%", f"%{norm(query)}%"] + [f"%{a}%" for a in abbr_parts]
+              + ([platform] if platform else []) + list(needed))
     best = {}
-    for gid, name, plat, year, votes, alias in db.execute(sql, params):
-        # Well-known releases outrank hacks and homebrew that share the name, and a game's own name
-        # outranks a collection that lists it as an alternate name.
-        s = score(query, alias) + min(0.2, math.log10(votes + 1) * 0.07) + (0.1 if alias == name else 0)
+    for gid, name, plat, year, votes, alias, abbr in db.execute(sql, params):
+        # Well-known releases outrank hacks and homebrew that share the name, a game's own name
+        # outranks a collection that lists it as an alternate name, and a typed year picks that release.
+        # Short forms are almost always meant for famous games, so popularity counts for more there.
+        text = max(score(query, alias), score(core, alias))
+        short_form = acronym_score(tokens, norm(alias), abbr)
+        fame = math.log10(votes + 1)
+        s = (max(text + min(0.2, fame * 0.07), short_form + min(0.75, fame * 0.25))
+             + (0.1 if alias == name else 0) + (0.3 if wanted_year and year == wanted_year else 0))
         if s > best.get(gid, (0,))[0]:
             best[gid] = (s, name, plat, year, votes)
     ranked = sorted(best.items(), key=lambda kv: -kv[1][0])
     return [(gid, name, plat, year, votes) for gid, (s, name, plat, year, votes) in ranked if s > 0.35]
 
 
-def group_games(games, limit=12):
-    """One entry per game name, holding every platform it came out on (most popular first)."""
+def group_games(games, year=None, limit=12):
+    """One entry per game name, holding every platform it came out on (the asked-for year,
+    then the most popular, first)."""
     groups = {}
     for game in games:  # already best match first, so the dict keeps that order
         groups.setdefault(norm(game[1]), []).append(game)
-    return [sorted(g, key=lambda game: -game[4]) for g in list(groups.values())[:limit]]
+    return [sorted(g, key=lambda game: (year is not None and game[3] != year, -game[4]))
+            for g in list(groups.values())[:limit]]
 
 
 def group_label(group):
@@ -465,19 +556,86 @@ def download_achievements(title, plat, args, cfg):
                 break
             icons.update(hits)
             start += 64
-    if not icons:
+    icons = [data for _, data in sorted(icons.items())]
+    named = exophase_achievements(title)
+    if not icons and not named:
         sys.exit(f"Xbox Live has no achievement icons for {title}.")
-    print(f"Found {len(icons)} achievement icons.")
 
-    folder = pick_folder(args.out, cfg, args.yes) / safe_filename(f"{title} [{plat}] achievements")
-    folder.mkdir(parents=True, exist_ok=True)
+    # entries: (menu label, file name, image bytes or None to download from url, url)
+    entries = []
     game_icon = fetch_or_none(f"{base}icon/0/8000")
     if game_icon:
-        (folder / ("game icon" + image_ext(game_icon))).write_bytes(game_icon)
-    width = len(str(len(icons)))
-    for n, (_, data) in enumerate(sorted(icons.items()), 1):
-        (folder / (f"achievement {n:0{width}d}" + image_ext(data))).write_bytes(data)
-    print(f"Saved {len(icons)} icons to {folder}")
+        entries.append(("Game icon (guide / mini dash)", "game icon", game_icon, None))
+    if named:
+        print(f"Found {len(named)} achievements.")
+        width = len(str(len(named)))
+        for n, (ach, data) in enumerate(zip(named, match_icons(named, icons)), 1):
+            entries.append((f"{ach['name']} ({ach['points']}G) - {ach['desc']}",
+                            f"{n:0{width}d} {ach['name']}", data, ach["icon"]))
+    else:
+        print(f"Found {len(icons)} achievement icons (no names for this game, so they're numbered).")
+        width = len(str(len(icons)))
+        for n, data in enumerate(icons, 1):
+            entries.append((f"Achievement icon {n}", f"achievement {n:0{width}d}", data, None))
+
+    picked = entries if args.yes or (args.quality or "").lower() == "all" else \
+        [entries[i] for i in choose_many("Which ones?", [e[0] for e in entries])]
+    folder = pick_folder(args.out, cfg, args.yes) / safe_filename(f"{title} [{plat}] achievements")
+    folder.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for _, name, data, url in picked:
+        data = data or fetch_or_none(url)
+        if data:
+            unique_path(folder / (safe_filename(name) + image_ext(data))).write_bytes(data)
+            saved += 1
+    print(f"Saved {saved} icon{'s' * (saved != 1)} to {folder}")
+
+
+def exophase_achievements(title):
+    """Names of an Xbox 360 game's achievements, in the game's order, from Exophase:
+    [{name, desc, points, icon}], or [] when it isn't listed."""
+    try:
+        games = get_json("https://api.exophase.com/public/archive/games", {"q": title})["games"]["list"]
+        games = [g for g in games if any(p["slug"] == "xbox-360" for p in g.get("platforms", []))]
+        # Japanese releases are listed separately; prefer the main one when the names tie.
+        games.sort(key=lambda g: "-jp-" in g.get("endpoint_awards", ""))
+        game = best_match(title, games, "title")
+        if not game:
+            return []
+        page = http_get(game["endpoint_awards"]).decode("utf-8", "replace")
+    except (urllib.error.URLError, ValueError, KeyError):
+        return []
+    out = []
+    for block in page.split("<li ")[1:]:
+        icon = re.search(r'class="award-image[^"]*" src="([^"?]+)', block)
+        name = re.search(r'award-title.*?<a [^>]*>(.*?)</a>', block, re.S)
+        if not (icon and name):
+            continue
+        desc = re.search(r'award-description[^>]*>\s*<p>(.*?)</p>', block, re.S)
+        points = re.search(r'award-points.*?<span>(\d+)</span>', block, re.S)
+        out.append({"name": html.unescape(name[1]).strip(), "icon": icon[1],
+                    "desc": html.unescape(re.sub(r"<[^>]+>", "", desc[1])).strip() if desc else "",
+                    "points": points[1] if points else "?"})
+    return out
+
+
+def match_icons(named, icons):
+    """Pair each named achievement with its original Xbox Live icon by comparing pixels.
+    Exophase keeps exact copies, so a match is an identical image; unmatched ones get None."""
+    Image, _ = pil()
+
+    def pixels(data):
+        try:
+            return Image.open(io.BytesIO(data)).convert("RGBA").tobytes()
+        except OSError:
+            return None
+
+    with ThreadPoolExecutor(16) as pool:
+        theirs = list(pool.map(lambda a: fetch_or_none(a["icon"]), named))
+    ours = {}
+    for data in icons:
+        ours.setdefault(pixels(data), data)
+    return [ours.get(pixels(data)) if data else None for data in theirs]
 
 
 def ms_store_icons(title, back_compat):
@@ -955,7 +1113,7 @@ def game_main(args, query, cfg):
             sys.exit("Achievement icons are only for Xbox 360 games (platform x360).")
         platform = XBOX360
 
-    groups = group_games(search_games(db, query, platform, args.type))
+    groups = group_games(search_games(db, query, platform, args.type), split_year(query)[1])
     if not groups:
         what = ART_TYPES[args.type].lower() if args.type else "game"
         where = f" on {platform}" if platform else ""

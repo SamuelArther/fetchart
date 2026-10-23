@@ -75,6 +75,8 @@ fetchart <game> [platform] [options]
 
 Game names can use dashes or quotes: `halo-3` and `"halo 3"` both work. If you leave out the platform, every platform is searched.
 
+Short names work too: `mw2`, `bo2`, `botw`, `oot`, `gta5`, `ff7`, `csgo`, `ssbm`, or a mix like `mw2 remastered`. When a name was used twice, add the year: `mw2 2009` is the original Modern Warfare 2, and `mw2 2022` is the remake.
+
 | Option | What it does |
 |---|---|
 | `-t box\|clean\|logo\|icon\|ach` | Skip the art-type menu |
@@ -128,7 +130,7 @@ Full names work too, e.g. `"Sega Dreamcast"`.
 | **clean** | Key art without the logo. Landscape, or a portrait crop | LaunchBox fanart, Steam library art |
 | **logo** | Key art with the logo | Steam capsules, LaunchBox banners and posters, or fanart with the game's logo laid on top |
 | **icon** | The square tile on the console's menu | See below |
-| **ach** | Every achievement icon of an Xbox 360 game, plus its game icon | Xbox Live image server |
+| **ach** | Xbox 360 achievement icons, listed by name, gamerscore and description. Pick one, a few (`1,4,9` or `10-20`), or all of them, plus the game icon | Xbox Live image server, names from Exophase |
 
 Where the **icon** art comes from, by platform:
 
@@ -154,7 +156,7 @@ Xbox 360 title IDs are looked up through [XboxUnity](http://xboxunity.net/).
 
 ## Credits and disclaimer
 
-The art comes from the LaunchBox Games Database community, Steam, the Microsoft Store, Xbox Live, XboxUnity, Nintendo, IMDb, Wikipedia, Wikimedia Commons, Deezer, Apple Music, and MusicBrainz / the Cover Art Archive. Thanks to all of them for keeping it online.
+The art comes from the LaunchBox Games Database community, Steam, the Microsoft Store, Xbox Live, XboxUnity, Exophase, Nintendo, IMDb, Wikipedia, Wikimedia Commons, Deezer, Apple Music, and MusicBrainz / the Cover Art Archive. Thanks to all of them for keeping it online.
 
 All art belongs to its respective owners. fetchart is meant for personal use, such as emulator frontends, media servers, desktop wallpapers and collection catalogs. It is not affiliated with any of the sites it pulls from, or with any game, film or music company.
 
