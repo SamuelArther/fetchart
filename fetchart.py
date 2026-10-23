@@ -351,7 +351,7 @@ def arrow_menu(title, rows, default=0, multi=False, preview=None):
     index, or with multi=True the ticked indexes (just the highlighted row if none are ticked)."""
     enable_ansi()
     n, cols = len(rows), shutil.get_terminal_size().columns
-    height = max(3, min(n, shutil.get_terminal_size().lines - 5))
+    height = min(n, max(3, shutil.get_terminal_size().lines - 5))  # rows on screen; never more than there are
     width = len(str(n))
     cur, top, ticked, typed, note, drawn = default, 0, set(), "", "", 0
     print()
