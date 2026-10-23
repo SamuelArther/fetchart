@@ -1,4 +1,5 @@
-"""Make an empty fake ROM library with real No-Intro / Redump style file names, for testing folder mode.
+"""Make empty fake libraries for testing folder mode: ROMs with real No-Intro / Redump style file names,
+and movies and shows named the ways people name them.
 
 usage: make_roms.py OUT_DIR   (OUT_DIR is deleted and rebuilt)
 """
@@ -38,8 +39,21 @@ sets = {
         "cover.jpg",
     ],
 }
+sets["Movies"] = [
+    "Inception (2010)/Inception (2010).mkv",
+    "The.Matrix.1999.1080p.BluRay.x264-GRP.mkv",
+    "Blade Runner 2049 (2017).mp4",
+    "Dune (2021) {imdb-tt1160419}/Dune.mkv",
+    "Dune/Dune.mkv",
+    "Spirited Away (2001).avi",
+    "Breaking Bad/Season 01/Breaking.Bad.S01E01.mkv",
+    "The Office (US)/Season 1/The Office - 1x01 - Pilot.mp4",
+    "Our Holiday 2015.mp4",
+    "notes.txt",
+]
 for folder, names in sets.items():
-    (root / folder).mkdir(parents=True)
     for name in names:
-        (root / folder / name).write_bytes(b"")
+        path = root / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
 print(root)

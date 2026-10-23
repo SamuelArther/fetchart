@@ -2,18 +2,24 @@
 
 Usage:
     fetchart                     menus for everything: category, name, platform, art, folder
-    fetchart <game> [platform] [-t box|clean|logo|icon|ach] [-r portrait|landscape] [-q QUALITY] [-o FOLDER] [-y]
+    fetchart <game> [platform] [-t TYPE] [-r portrait|landscape] [-q QUALITY] [-o FOLDER] [-y] [-w]
     fetchart --folder DIR [platform] [-t TYPE] [-o FOLDER] [-y]   art for every ROM in a folder
+    fetchart --folder DIR movie|tv [-y]                           posters for a folder of movies or shows
+    fetchart --steam [STEAM_DIR] [-y]                             Steam library art for non-Steam games
     fetchart --update            re-download the game database
 
 Art types:
-    box     box cover art, rating and all            (LaunchBox box fronts, every region)
-    clean   key art without the logo                 (LaunchBox fanart backgrounds, Steam library hero)
-    logo    key art with the logo                    (Steam capsules, LaunchBox banners/posters, or
+    box        box cover art, rating and all         (LaunchBox box fronts, every region)
+    clean      key art without the logo              (LaunchBox fanart backgrounds, Steam library hero)
+    logo       key art with the logo                 (Steam capsules, LaunchBox banners/posters, or
                                                       fanart with the game's clear logo laid on top)
-    icon    dashboard icon / tile                    (Xbox 360 marketplace tiles + banners, Microsoft Store
+    clearlogo  just the logo, see-through background (Steam library logo, LaunchBox clear logos)
+    icon       dashboard icon / tile                 (Xbox 360 marketplace tiles + banners, Microsoft Store
                                                       squares, Nintendo eShop icons, Steam + LaunchBox icons)
-    ach     Xbox 360 achievement icons, by name      (the Xbox Live image server, by title ID; names from Exophase)
+    ach        achievement / trophy icons, by name   (Xbox, PlayStation, Steam and RetroAchievements lists
+                                                      from Exophase; Xbox 360 originals from Xbox Live)
+
+-w / --wallpaper saves the best landscape key art (or painting) and sets it as the desktop background.
 
 Short names work: mw2, botw, gta5, ff7, "mw2 remastered". Add a year for remakes: "mw2 2009".
 
@@ -38,6 +44,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -47,11 +54,12 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 UA = {"User-Agent": f"fetchart/{__version__} (+https://github.com/SamuelArther/fetchart)"}
 LB_DUMP = "https://gamesdb.launchbox-app.com/Metadata.zip"
@@ -69,16 +77,20 @@ NEEDED_TYPES = {
     "box": ("Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front"),
     "clean": ("Fanart - Background",),
     "logo": ("Fanart - Background", "Banner", "Poster"),
+    "clearlogo": ("Clear Logo",),
     "icon": (),  # icons mostly come from console stores, so any game qualifies
     "ach": (),
+    "wallpaper": ("Fanart - Background",),
     None: (),  # art type not picked yet
 }
 ART_TYPES = {
     "box": "Box cover art (the retail cover, rating and all)",
     "clean": "Key art, no logo",
     "logo": "Key art, with logo",
+    "clearlogo": "Clear logo (just the logo, see-through background)",
     "icon": "Dashboard icon / tile (the square on the console menu)",
-    "ach": "Xbox 360 achievement icons (all of them)",
+    "ach": "Achievement icons (pick any or all)",
+    "wallpaper": "Desktop wallpaper (the best key art, set as your background)",
 }
 XBOX360 = "Microsoft Xbox 360"
 REGION_ORDER = ["North America", "United States", "World", None, "Canada", "Europe", "United Kingdom",
@@ -662,6 +674,14 @@ def region_rank(region):
     return REGION_ORDER.index(region) if region in REGION_ORDER else len(REGION_ORDER)
 
 
+def images_by_type(db, gid):
+    """A game's LaunchBox images: {type: [(region, url)]}, best region first."""
+    by_type = {}
+    for t, region, url in sorted(game_images(db, gid), key=lambda i: region_rank(i[1])):
+        by_type.setdefault(t, []).append((region, url))
+    return by_type
+
+
 # ---------------------------------------------------------------- Steam (bonus official key art)
 
 def steam_assets(title):
@@ -676,7 +696,8 @@ def steam_assets(title):
                    "data_request": {"include_assets": True}}
         items = get_json("https://api.steampowered.com/IStoreBrowseService/GetItems/v1",
                          {"input_json": json.dumps(payload)})["response"].get("store_items", [])
-        return items[0].get("assets", {}) if items else {}
+        # Type 0 is a game. Others are DLC and soundtracks, whose art carries a badge ("Halo 3" is MCC DLC).
+        return items[0].get("assets", {}) if items and items[0].get("type", 0) == 0 else {}
     except (urllib.error.URLError, KeyError, ValueError):
         return {}
 
@@ -697,6 +718,12 @@ def steam_urls(assets, keys):
             seen.add(name)
             out.append(STEAM_CDN + fmt.replace("${FILENAME}", name))
     return out
+
+
+def steam_logos(assets):
+    """The library logo (transparent PNG). The store API doesn't list it, but every app has one at a fixed path."""
+    m = re.search(r"apps/(\d+)/", assets.get("asset_url_format", ""))
+    return [f"{STEAM_CDN}steam/apps/{m[1]}/{name}" for name in ("logo_2x.png", "logo.png")] if m else []
 
 
 # ---------------------------------------------------------------- console store icons
@@ -755,11 +782,49 @@ def fetch_or_none(url):
         return None
 
 
-def download_achievements(title, plat, args, cfg):
-    """Save every achievement icon of an Xbox 360 game into '<folder>/<title> achievements'."""
+# ---------------------------------------------------------------- achievements and trophies
+
+# Old consoles get their achievements from RetroAchievements, which Exophase lists under one "retro"
+# platform with the console's name: LaunchBox platform -> that name.
+RETRO_SYSTEMS = {
+    "Nintendo Entertainment System": "NES", "Nintendo Famicom Disk System": "Famicom Disk System",
+    "Super Nintendo Entertainment System": "SNES", "Nintendo 64": "N64", "Nintendo GameCube": "GameCube",
+    "Nintendo Wii": "Wii", "Nintendo Game Boy": "Game Boy", "Nintendo Game Boy Color": "GBC",
+    "Nintendo Game Boy Advance": "GBA", "Nintendo DS": "NDS", "Nintendo Virtual Boy": "Virtual Boy",
+    "Nintendo Pokemon Mini": "Pokemon Mini", "Sega Genesis": "Genesis", "Sega Master System": "Master System",
+    "Sega Game Gear": "Game Gear", "Sega 32X": "32X", "Sega CD": "Sega CD", "Sega Saturn": "Saturn",
+    "Sega Dreamcast": "Dreamcast", "Sega SG-1000": "SG-1000", "Sony Playstation": "PS1",
+    "Sony Playstation 2": "PS2", "Sony PSP": "PSP", "NEC TurboGrafx-16": "PC Engine",
+    "NEC TurboGrafx-CD": "PC Engine CD", "Atari 2600": "Atari 2600", "Atari 7800": "Atari 7800",
+    "Atari Jaguar": "Atari Jaguar", "Atari Lynx": "Atari Lynx", "3DO Interactive Multiplayer": "3DO",
+    "Arcade": "Arcade", "SNK Neo Geo CD": "Neo Geo CD", "SNK Neo Geo Pocket": "Neo Geo Pocket",
+    "SNK Neo Geo Pocket Color": "Neo Geo Pocket", "WonderSwan": "WonderSwan", "WonderSwan Color": "WonderSwan",
+    "ColecoVision": "ColecoVision", "Mattel Intellivision": "Intellivision", "Microsoft MSX": "MSX",
+    "Microsoft MSX2": "MSX", "Apple II": "Apple II", "Amstrad CPC": "Amstrad CPC", "NEC PC-8801": "PC-8000/8800",
+}
+# LaunchBox platform -> where Exophase lists its achievements: [(platform slug, console name or None)], best first.
+ACH_SOURCES = {
+    XBOX360: [("xbox-360", None), ("xbox-live-arcade", None)],
+    "Microsoft Xbox One": [("xbox-one", None)],
+    "Microsoft Xbox Series X/S": [("xbox-series", None), ("xbox-one", None)],
+    "Windows": [("steam", None), ("windows-10", None), ("gog", None), ("epic", None), ("gfwl", None)],
+    "Sony Playstation 3": [("ps3", None)], "Sony Playstation 4": [("ps4", None)],
+    "Sony Playstation 5": [("ps5", None)], "Sony Playstation Vita": [("ps-vita", None)],
+    "Android": [("android", None)], "Apple iOS": [("apple-ios", None)], "Apple Mac OS": [("apple-mac", None)],
+    **{plat: [("retro", name)] for plat, name in RETRO_SYSTEMS.items()},
+}
+TROPHY_PLATFORMS = {"Sony Playstation 3", "Sony Playstation 4", "Sony Playstation 5", "Sony Playstation Vita"}
+
+
+def ach_word(plat):
+    return "trophy" if plat in TROPHY_PLATFORMS else "achievement"
+
+
+def xbox360_achievement_icons(title):
+    """The original icons from the Xbox Live image server: (list of image bytes, game icon bytes), or ([], None)."""
     item = xbox360_title(title)
     if not item:
-        sys.exit(f"Couldn't find the Xbox 360 title ID for {title}.")
+        return [], None
     base = f"http://image.xboxlive.com/global/t.{item['TitleID'].lower()}/"
     print(f"Finding achievement icons for {title} (title ID {item['TitleID']})...")
     # Achievement image IDs are small hex numbers counting up from 1; scan in blocks until one comes back empty.
@@ -772,22 +837,33 @@ def download_achievements(title, plat, args, cfg):
                 break
             icons.update(hits)
             start += 64
-    icons = [data for _, data in sorted(icons.items())]
-    named = exophase_achievements(title)
+    return [data for _, data in sorted(icons.items())], fetch_or_none(f"{base}icon/0/8000")
+
+
+def download_achievements(title, plat, args, cfg):
+    """Save a game's achievement (or trophy) icons, by name, into '<folder>/<title> [platform] achievements'."""
+    word = ach_word(plat)
+    icons, game_icon = [], None
+    if plat == XBOX360:
+        icons, game_icon = xbox360_achievement_icons(title)
+    if not icons:
+        print(f"Finding {word} icons for {title} [{plat}]...")
+    named = exophase_achievements(title, plat)
     if not icons and not named:
-        sys.exit(f"Xbox Live has no achievement icons for {title}.")
+        sys.exit(f"Couldn't find {word} icons for {title} [{plat}].")
 
     # entries: (menu label, file name, image bytes or None to download from url, url)
     entries = []
-    game_icon = fetch_or_none(f"{base}icon/0/8000")
     if game_icon:
         entries.append(("Game icon (guide / mini dash)", "game icon", game_icon, None))
     if named:
-        print(f"Found {len(named)} achievements.")
+        print(f"Found {len(named)} {'trophies' if word == 'trophy' else 'achievements'}.")
         width = len(str(len(named)))
-        for n, (ach, data) in enumerate(zip(named, match_icons(named, icons)), 1):
-            entries.append((f"{ach['name']} ({ach['points']}G) - {ach['desc']}",
-                            f"{n:0{width}d} {ach['name']}", data, ach["icon"]))
+        datas = match_icons(named, icons) if icons else [None] * len(named)
+        for n, (ach, data) in enumerate(zip(named, datas), 1):
+            badge = f" ({ach['badge']})" if ach["badge"] else ""
+            desc = f" - {ach['desc']}" if ach["desc"] else ""
+            entries.append((f"{ach['name']}{badge}{desc}", f"{n:0{width}d} {ach['name']}", data, ach["icon"]))
     else:
         print(f"Found {len(icons)} achievement icons (no names for this game, so they're numbered).")
         width = len(str(len(icons)))
@@ -796,31 +872,52 @@ def download_achievements(title, plat, args, cfg):
 
     picked = entries if args.yes or (args.quality or "").lower() == "all" else \
         [entries[i] for i in choose_many("Which ones?", [e[0] for e in entries], preview=lambda: open_preview(
-            f"{title} achievements", [(e[0], data_uri(e[2]) if e[2] else e[3], None) for e in entries], small=True))]
-    folder = pick_folder(args.out, cfg, args.yes) / safe_filename(f"{title} [{plat}] achievements")
+            f"{title} {word} icons", [(e[0], data_uri(e[2]) if e[2] else e[3], None) for e in entries], small=True))]
+    folder_name = f"{title} [{plat}] {'trophies' if word == 'trophy' else 'achievements'}"
+    folder = pick_folder(args.out, cfg, args.yes) / safe_filename(folder_name)
     folder.mkdir(parents=True, exist_ok=True)
+
+    def get(entry):
+        return entry[2] or fetch_or_none(entry[3])
+
+    with ThreadPoolExecutor(8) as pool:
+        datas = list(pool.map(get, picked))
     saved = 0
-    for _, name, data, url in picked:
-        data = data or fetch_or_none(url)
+    for (_, name, _, _), data in zip(picked, datas):
         if data:
             unique_path(folder / (safe_filename(name) + image_ext(data))).write_bytes(data)
             saved += 1
     print(f"Saved {saved} icon{'s' * (saved != 1)} to {folder}")
 
 
-def exophase_achievements(title):
-    """Names of an Xbox 360 game's achievements, in the game's order, from Exophase:
-    [{name, desc, points, icon}], or [] when it isn't listed."""
+def exophase_title(title):
+    """Exophase names in a form that compares well: RetroAchievements writes "Legend of Zelda, The: ..."."""
+    return re.sub(r"^(.*?), (The|A|An)\b(.*)$", r"\2 \1\3", title)
+
+
+def exophase_achievements(title, plat=XBOX360):
+    """A game's achievements or trophies, in the game's order, from Exophase:
+    [{name, desc, badge, icon, small}], or [] when it isn't listed. badge is the gamerscore, points or
+    trophy grade; icon is the biggest copy of the picture, small the 64px one."""
+    sources = ACH_SOURCES.get(plat, [])
+
+    def source_rank(game):  # which of the platform's sources lists this game, best first; None for none
+        for i, (slug, name) in enumerate(sources):
+            if any(p["slug"] == slug and name in (None, p.get("name")) for p in game.get("platforms", [])):
+                return i
+        return None
+
     # Exophase drops edition words that XboxUnity keeps ("Minecraft: Xbox 360 Edition" is just "Minecraft").
     short = re.sub(r"[\s:\-]*\b(for |on )?(xbox 360|x360)( edition)?\s*$", "", title, flags=re.I).strip()
     try:
         for query in dict.fromkeys((title, short)):
             found = get_json("https://api.exophase.com/public/archive/games", {"q": query}).get("games")
-            games = [g for g in (found or {}).get("list", [])
-                     if any(p["slug"] == "xbox-360" for p in g.get("platforms", []))]
+            # RetroAchievements also lists ROM hacks ("~Hack~ ...") and bonus sets ("... [Subset - ...]").
+            games = [dict(g, plain=exophase_title(g["title"])) for g in (found or {}).get("list", [])
+                     if source_rank(g) is not None and not g["title"].startswith("~") and "[Subset" not in g["title"]]
             # Japanese releases are listed separately; prefer the main one when the names tie.
-            games.sort(key=lambda g: "-jp-" in g.get("endpoint_awards", ""))
-            game = best_match(query, games, "title")
+            games.sort(key=lambda g: (source_rank(g), "-jp-" in g.get("endpoint_awards", "")))
+            game = best_match(query, games, "plain")
             if game:
                 break
         else:
@@ -828,6 +925,11 @@ def exophase_achievements(title):
         page = http_get(game["endpoint_awards"]).decode("utf-8", "replace")
     except (urllib.error.URLError, ValueError, KeyError, TypeError, AttributeError):
         return []
+    return parse_exophase_awards(page, game.get("environment_slug"))
+
+
+def parse_exophase_awards(page, environment):
+    """The achievements on an Exophase achievements or trophies page."""
     out = []
     for block in page.split("<li ")[1:]:
         icon = re.search(r'class="award-image[^"]*" src="([^"?]+)', block)
@@ -836,9 +938,16 @@ def exophase_achievements(title):
             continue
         desc = re.search(r'award-description[^>]*>\s*<p>(.*?)</p>', block, re.S)
         points = re.search(r'award-points.*?<span>(\d+)</span>', block, re.S)
-        out.append({"name": html.unescape(name[1]).strip(), "icon": icon[1],
-                    "desc": html.unescape(re.sub(r"<[^>]+>", "", desc[1])).strip() if desc else "",
-                    "points": points[1] if points else "?"})
+        grade = re.search(r'exo-icon-trophy-(platinum|gold|silver|bronze)', block)
+        if grade:
+            badge = grade[1].title()
+        elif points:
+            badge = points[1] + ("G" if environment == "xbox" else " points")
+        else:
+            badge = ""
+        out.append({"name": html.unescape(name[1]).strip(), "small": icon[1], "badge": badge,
+                    "icon": icon[1].replace("/awards/s/", "/awards/o/"),  # "o" is the original size
+                    "desc": html.unescape(re.sub(r"<[^>]+>", "", desc[1])).strip() if desc else ""})
     return out
 
 
@@ -854,7 +963,7 @@ def match_icons(named, icons):
             return None
 
     with ThreadPoolExecutor(16) as pool:
-        theirs = list(pool.map(lambda a: fetch_or_none(a["icon"]), named))
+        theirs = list(pool.map(lambda a: fetch_or_none(a["small"]), named))
     ours = {}
     for data in icons:
         ours.setdefault(pixels(data), data)
@@ -922,8 +1031,8 @@ def nintendo_icons(title, platform):
 # ---------------------------------------------------------------- candidates
 
 class Art:
-    """One downloadable option. crop = cut to 2:3 portrait; logo = clear-logo URL to lay on top;
-    scale = resize a small square icon up to this many pixels."""
+    """One downloadable option. crop = cut to 2:3 portrait (True) or to this width/height ratio;
+    logo = clear-logo URL to lay on top; scale = resize a small square icon up to this many pixels."""
 
     def __init__(self, url, source, crop=False, logo=None, scale=None, preview=None):
         self.url, self.source, self.crop, self.logo, self.scale = url, source, crop, logo, scale
@@ -936,12 +1045,20 @@ class Art:
             return None
         if self.scale:
             return self.scale, self.scale
-        w, h = self.size
-        return (min(w, round(h * 2 / 3)), h) if self.crop else (w, h)
+        return crop_size(self.size, self.crop)
 
     def label(self):
         s = self.final_size()
         return (f"{s[0]}x{s[1]}" if s else "size ?").ljust(12) + self.source
+
+
+def crop_size(size, crop):
+    """The size after cutting the middle out of an image to the crop ratio (True = 2:3 portrait)."""
+    w, h = size
+    if not crop:
+        return w, h
+    ratio = 2 / 3 if crop is True else crop
+    return min(w, round(h * ratio)), min(h, round(w / ratio))
 
 
 def probe_size(art):
@@ -957,10 +1074,7 @@ def probe_size(art):
 
 
 def gather(db, gid, title, platform, kind, orient):
-    imgs = game_images(db, gid)
-    by_type = {}
-    for t, region, url in sorted(imgs, key=lambda i: region_rank(i[1])):
-        by_type.setdefault(t, []).append((region, url))
+    by_type = images_by_type(db, gid)
     fanart = [url for _, url in by_type.get("Fanart - Background", [])]
     logos = [url for _, url in by_type.get("Clear Logo", [])]
     portrait = orient == "portrait"
@@ -994,6 +1108,12 @@ def gather(db, gid, title, platform, kind, orient):
         return out
 
     steam = steam_assets(title)
+    if kind == "clearlogo":
+        for url in steam_logos(steam):
+            out.append(Art(url, "Steam logo (official)"))
+        for region, url in by_type.get("Clear Logo", []):
+            out.append(Art(url, f"clear logo, {region}" if region else "clear logo"))
+        return out
     if kind == "clean":
         for url in steam_urls(steam, ["library_hero_2x", "library_hero"]):
             out.append(Art(url, "Steam hero (official)" + (", cropped" if portrait else ""), crop=portrait))
@@ -1055,13 +1175,13 @@ def render(art):
     img = Image.open(io.BytesIO(data)).convert("RGB")
     w, h = img.size
     if art.crop:
-        cw = min(w, round(h * 2 / 3))
-        left = (w - cw) // 2
-        img = img.crop((left, 0, left + cw, h))
-        w = cw
+        cw, ch = crop_size((w, h), art.crop)
+        left, top = (w - cw) // 2, (h - ch) // 2
+        img = img.crop((left, top, left + cw, top + ch))
+        w, h = cw, ch
     if art.logo:
         logo = Image.open(io.BytesIO(http_get(art.logo))).convert("RGBA")
-        scale = min(w * (0.8 if art.crop else 0.45) / logo.width, h * 0.3 / logo.height)
+        scale = min(w * (0.8 if w < h else 0.45) / logo.width, h * 0.3 / logo.height)
         logo = logo.resize((max(1, round(logo.width * scale)), max(1, round(logo.height * scale))), Image.LANCZOS)
         x, y = (w - logo.width) // 2, round(h * 0.93) - logo.height
         shadow = Image.new("RGBA", logo.size, (0, 0, 0, 0))
@@ -1077,7 +1197,7 @@ def render(art):
 # ---------------------------------------------------------------- movies, TV and albums
 
 MEDIA = {"movie": "movie", "movies": "movie", "film": "movie", "tv": "tv", "show": "tv", "tvshow": "tv",
-         "series": "tv", "album": "album", "music": "album", "cd": "album", "song": "album",
+         "album": "album", "music": "album", "cd": "album", "song": "album",
          "painting": "painting", "paintings": "painting", "art": "painting", "artwork": "painting"}
 # Top menu when fetchart is run with no arguments: key -> (menu text, name prompt)
 CATEGORIES = {
@@ -1086,6 +1206,9 @@ CATEGORIES = {
     "album": ("Music (album cover)", "Album (artist + album name works best): "),
     "painting": ("Painting / real art", "Painting name (add the artist if you know it): "),
     "folder": ("A whole folder of games (art for every ROM)", "Folder with your games (paste its path): "),
+    "videos": ("A whole folder of movies or TV shows (posters for Plex, Jellyfin, Kodi)",
+               "Folder with your movies or shows (paste its path): "),
+    "steam": ("Steam: art for my non-Steam games", None),
 }
 TV_TYPES = {"tvSeries", "tvMiniSeries"}
 
@@ -1275,7 +1398,8 @@ REGION_TAGS = {"usa": "North America", "us": "North America", "world": "World", 
                "eu": "Europe", "uk": "United Kingdom", "japan": "Japan", "jp": "Japan", "australia": "Australia",
                "canada": "Canada", "germany": "Germany", "france": "France", "spain": "Spain", "italy": "Italy",
                "korea": "Korea", "brazil": "Brazil"}
-FOLDER_SUBDIRS = {"box": "covers", "clean": "fanart", "logo": "keyart", "icon": "icons"}
+FOLDER_SUBDIRS = {"box": "covers", "clean": "fanart", "logo": "keyart", "clearlogo": "marquees", "icon": "icons"}
+VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".webm", ".mpg", ".mpeg", ".divx"}
 SURE_MATCH = 1.0  # name match needed to save without asking (1.3 = exactly the same name)
 
 
@@ -1345,16 +1469,19 @@ def fetch_best(game, kind, orient, region, cache, lock):
     return result
 
 
-def folder_main(args, folder_text, cfg):
+def folder_main(args, folder_text, cfg, videos=False):
     """Art for every game in a folder, saved under each ROM's own file name, as emulator frontends expect."""
     folder = Path(os.path.expandvars(os.path.expanduser(folder_text.strip().strip('"').strip("'"))))
     if not folder.is_dir():
         raise NotFound(f"There's no folder at {folder}.")
+    media = MEDIA.get(re.sub(r"[^a-z]", "", (args.platform or "").lower()))
+    if videos or media in ("movie", "tv") or (not args.platform and looks_like_videos(folder)):
+        return video_folder_main(args, folder, media)
+    if args.type and args.type not in FOLDER_SUBDIRS:
+        sys.exit(f"-t {args.type} is one game at a time. For folders use: {', '.join(FOLDER_SUBDIRS)}")
     games = scan_folder(folder)
     if not games:
         raise NotFound(f"No games in {folder}.")
-    if args.type == "ach":
-        sys.exit("Achievement icons are one game at a time: fetchart <game> x360 -t ach")
     db = open_index(args.update)
 
     # The system: the one given, else the folder's name ("N64", "PS2", "Sega Genesis"), else each file's extension.
@@ -1365,7 +1492,7 @@ def folder_main(args, folder_text, cfg):
     systems = sorted({platform} if platform else {p for _, p in games if p})
     print(f"\nFound {len(games)} games in {folder}" + (f" ({', '.join(systems)})" if systems else "") + ".")
 
-    kinds = ["box", "clean", "logo", "icon"]
+    kinds = list(FOLDER_SUBDIRS)
     kind = args.type or kinds[choose("What art do you want for each game?", [ART_TYPES[k] for k in kinds],
                                      auto=args.yes)]
     orient = args.orient
@@ -1445,6 +1572,366 @@ def folder_main(args, folder_text, cfg):
 
     print(f"\nDone: {counts['saved']} saved, {counts['had it']} already had art, {counts['unsure']} skipped, "
           f"{counts['no match']} not found, {counts['failed']} failed.\nThe art is in {out}")
+
+
+# ---------------------------------------------------------------- whole folders of movies and shows
+
+EPISODE = re.compile(r"\bs\d{1,2}\s?e\d{1,3}\b|\b\d{1,2}x\d{2}\b", re.I)
+SEASON_DIR = re.compile(r"(season|series|staffel|saison|temporada)\s*\d+|specials|s\d{1,2}", re.I)
+# Release-name junk that ends a title when a file name has no year ("Inception.1080p.BluRay.x264").
+RELEASE_TAGS = re.compile(r"[\s._\-\[(]+(?:\d{3,4}p|4k|uhd|hdr|blu-?ray|bdrip|brrip|web-?dl|webrip|hdtv|dvdrip|"
+                          r"x26[45]|h\.?26[45]|hevc|remux|proper|repack|extended|unrated)\b.*", re.I)
+
+
+def video_title(name):
+    """Title, year and IMDb ID in a movie or show's file or folder name:
+    "Inception (2010) {imdb-tt1375666}" -> ("Inception", 2010, "tt1375666"),
+    "The.Matrix.1999.1080p.BluRay.x264-GRP" -> ("The Matrix", 1999, None)."""
+    imdb = re.search(r"\btt\d{7,}\b", name)
+    name = re.sub(r"\{[^}]*\}", " ", name)
+    if " " not in name.strip():
+        name = re.sub(r"[._]+", " ", name)
+    # A year in brackets, else the last bare one ("Blade Runner 2049 2017 1080p" is from 2017).
+    m = (re.search(r"^(.+?)\s*[\[(]((?:19|20)\d\d)[\])]", name)
+         or re.search(r"^(.+)[\s\-]+((?:19|20)\d\d)(?!\d)", name))
+    title, year = (m[1], int(m[2])) if m else (RELEASE_TAGS.sub("", name), None)
+    title = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", title).replace("_", " ")  # "The Office (US)"
+    return re.sub(r"\s+", " ", title).strip(" -.("), year, imdb[0] if imdb else None
+
+
+def has_videos(folder):
+    return any(f.suffix.lower() in VIDEO_EXTS for f in folder.iterdir() if f.is_file())
+
+
+def is_show(folder):
+    """A show's folder has season folders, or video files named like episodes (S01E02, 1x02)."""
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return False
+    return (any(e.is_dir() and SEASON_DIR.fullmatch(e.name) for e in entries)
+            or any(e.is_file() and e.suffix.lower() in VIDEO_EXTS and EPISODE.search(e.stem) for e in entries))
+
+
+def looks_like_videos(folder):
+    """True when a folder holds movies or shows: video files in it, or in the folders inside it."""
+    try:
+        return has_videos(folder) or any(is_show(d) or has_videos(d)
+                                         for d in sorted(folder.iterdir())[:30] if d.is_dir())
+    except OSError:
+        return False
+
+
+def scan_videos(folder):
+    """The movies and shows in a folder: [(name to look up, poster path, "movie" or "tv")].
+    A movie or show in its own folder gets poster.jpg in it; a loose movie file gets "<file name>-poster.jpg"
+    next to it. Plex, Jellyfin, Emby and Kodi all read those."""
+    others = [d for d in folder.iterdir() if d.is_dir() and not SEASON_DIR.fullmatch(d.name)]
+    if is_show(folder) and not any(is_show(d) or has_videos(d) for d in others):  # pointed straight at one show
+        return [(folder.name, folder / "poster.jpg", "tv")]
+    out = []
+    for entry in sorted(folder.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            if is_show(entry):
+                out.append((entry.name, entry / "poster.jpg", "tv"))
+            elif has_videos(entry):
+                out.append((entry.name, entry / "poster.jpg", "movie"))
+        elif entry.suffix.lower() in VIDEO_EXTS and not EPISODE.search(entry.stem):
+            out.append((entry.stem, folder / f"{entry.stem}-poster.jpg", "movie"))
+    return out
+
+
+def find_poster(name, kind):
+    """IMDb matches for a movie or show's file name: (candidates best first, sure). Each candidate is an
+    IMDb suggestion with a poster."""
+    title, year, imdb = video_title(name)
+    if not (imdb or title):
+        return [], False
+    items = [d for d in imdb_search(imdb or title)
+             if d.get("l") and d.get("i", {}).get("imageUrl") and d.get("qid") not in (None, "videoGame")]
+    if imdb:
+        return items[:1], bool(items)
+    same_kind = [d for d in items if (d["qid"] in TV_TYPES) == (kind == "tv")]
+    exact = [d for d in same_kind if norm(d["l"]) == norm(title)]
+    if year:  # release years differ by a year between countries
+        dated = [d for d in exact if abs((d.get("y") or 0) - year) <= 1]
+        if dated:
+            return dated + [d for d in items if d not in dated], True
+    elif exact:
+        return exact + [d for d in items if d not in exact], len(exact) == 1
+    return sorted(items, key=lambda d: -score(title, d["l"]))[:8], False
+
+
+def imdb_label(d):
+    return f"{d['l']} ({d.get('y', '?')}) [{'TV' if d['qid'] in TV_TYPES else d['qid']}]"
+
+
+def video_folder_main(args, folder, media):
+    """A poster for every movie and show in a folder, where media servers look for them."""
+    entries = scan_videos(folder)
+    if media in ("movie", "tv"):
+        entries = [(name, dest, media) for name, dest, _ in entries]
+    if not entries:
+        raise NotFound(f"No movies or shows in {folder}.")
+    shows = sum(kind == "tv" for _, _, kind in entries)
+    print(f"\nFound {len(entries) - shows} movies and {shows} shows in {folder}.\n")
+    total, width = len(entries), len(str(len(entries)))
+    counts = {"saved": 0, "had it": 0, "unsure": 0, "no match": 0, "failed": 0}
+    unsure = []
+
+    def report(n, status, name, match=None):
+        counts[status] += 1
+        print(f"[{n:>{width}}/{total}] {status:<8} {name}" + (f"  ->  {imdb_label(match)}" if match else ""))
+
+    def save(dest, match):
+        try:
+            data = http_get(match["i"]["imageUrl"], timeout=90)
+        except (urllib.error.URLError, OSError):
+            return False
+        dest.with_suffix(image_ext(data)).write_bytes(data)
+        return True
+
+    def handle(entry):  # -> (status, matches)
+        name, dest, kind = entry
+        if any(dest.with_suffix(ext).exists() for ext in (".jpg", ".png", ".webp")):
+            return "had it", []
+        found, sure = find_poster(name, kind)
+        if not found:
+            return "no match", []
+        if not sure:
+            return "unsure", found
+        return "saved" if save(dest, found[0]) else "failed", found
+
+    with ThreadPoolExecutor(6) as pool:  # map hands results back in order, so the report reads top to bottom
+        for n, ((name, dest, _), (status, found)) in enumerate(zip(entries, pool.map(handle, entries)), 1):
+            report(n, status, name, found[0] if found else None)
+            if status == "unsure":
+                unsure.append((n, name, dest, found))
+
+    were = "was" if len(unsure) == 1 else "were"
+    if unsure and not args.yes:
+        print(f"\n{len(unsure)} {were}n't a sure match. Pick the right one for each:")
+        for i, (_, name, dest, found) in enumerate(unsure, 1):
+            pick = choose(f'({i}/{len(unsure)}) Which one is "{name}"?',
+                          [imdb_label(d) for d in found] + ["Skip this one", "Skip the rest"])
+            if pick == len(found) + 1:
+                break
+            if pick < len(found):
+                counts["unsure"] -= 1
+                ok = save(dest, found[pick])
+                counts["saved" if ok else "failed"] += 1
+                print(f"  saved {dest.relative_to(folder)}" if ok
+                      else f"  couldn't download the poster for {found[pick]['l']}")
+    elif unsure:
+        print(f"\n{len(unsure)} {were}n't a sure match, so {'it was' if len(unsure) == 1 else 'they were'} "
+              "skipped. Run without -y to pick by hand.")
+    print(f"\nDone: {counts['saved']} saved, {counts['had it']} already had a poster, {counts['unsure']} skipped, "
+          f"{counts['no match']} not found, {counts['failed']} failed.")
+
+
+# ---------------------------------------------------------------- Steam library art for non-Steam games
+
+# Files in Steam's grid folder are named after the shortcut's app ID plus one of these: suffix -> what it is.
+STEAM_SLOTS = {"p": "cover", "": "wide cover", "_hero": "background", "_logo": "logo"}
+STEAM_ID_BASE = 76561197960265728  # SteamID64 of account 0; userdata folders use the account number
+
+
+def find_steam():
+    """Steam's install folder, or None."""
+    if os.name == "nt":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+                path = Path(winreg.QueryValueEx(key, "SteamPath")[0])
+            if (path / "userdata").is_dir():
+                return path
+        except OSError:
+            pass
+        candidates = [Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Steam"]
+    elif sys.platform == "darwin":
+        candidates = [Path.home() / "Library" / "Application Support" / "Steam"]
+    else:
+        candidates = [Path.home() / ".local/share/Steam", Path.home() / ".steam/steam",
+                      Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam"]
+    return next((c for c in candidates if (c / "userdata").is_dir()), None)
+
+
+def read_binary_vdf(data):
+    """Steam's binary KeyValues format (shortcuts.vdf) as nested dicts."""
+    pos = 0
+
+    def text():
+        nonlocal pos
+        end = data.index(b"\0", pos)
+        value, pos = data[pos:end].decode("utf-8", "replace"), end + 1
+        return value
+
+    def table():
+        nonlocal pos
+        out = {}
+        while pos < len(data):
+            kind = data[pos]
+            pos += 1
+            if kind == 8:
+                return out
+            key = text()
+            if kind == 0:
+                out[key] = table()
+            elif kind == 1:
+                out[key] = text()
+            elif kind in (2, 3, 7):  # int32, float32, uint64
+                size = 8 if kind == 7 else 4
+                out[key] = int.from_bytes(data[pos:pos + size], "little")
+                pos += size
+            else:
+                raise ValueError(f"unknown value type {kind} in a VDF file")
+        return out
+
+    return table()
+
+
+def steam_shortcuts(path):
+    """The non-Steam games added to an account: [(app ID, name)]."""
+    out = []
+    for entry in read_binary_vdf(path.read_bytes()).get("shortcuts", {}).values():
+        entry = {k.lower(): v for k, v in entry.items()}
+        name = entry.get("appname", "").strip()
+        # Steam has saved the ID since 2019; before that it was worked out from the program and name.
+        appid = entry.get("appid") or zlib.crc32((entry.get("exe", "") + name).encode()) | 0x80000000
+        if name:
+            out.append((appid & 0xFFFFFFFF, name))
+    return out
+
+
+def steam_accounts(root):
+    """Accounts that have non-Steam games: [(userdata folder, account name)], last signed in first."""
+    names, recent = {}, None
+    try:
+        users = (root / "config" / "loginusers.vdf").read_text(encoding="utf-8", errors="replace")
+        for sid, body in re.findall(r'"(\d{17})"\s*\{(.*?)\}', users, re.S):
+            account = str(int(sid) - STEAM_ID_BASE)
+            persona = re.search(r'"PersonaName"\s+"([^"]*)"', body)
+            names[account] = persona[1] if persona else account
+            if re.search(r'"MostRecent"\s+"1"', body):
+                recent = account
+    except OSError:
+        pass
+    folders = sorted(d for d in (root / "userdata").iterdir() if (d / "config" / "shortcuts.vdf").is_file())
+    folders.sort(key=lambda d: d.name != recent)
+    return [(d, names.get(d.name, d.name)) for d in folders]
+
+
+def steam_grid_art(db, game, steam):
+    """Candidates for each grid file, best first: {suffix: [Art]}. game is a LaunchBox match or None,
+    steam the Steam store assets of a game with the same name ({} if none)."""
+    out = {suffix: [] for suffix in STEAM_SLOTS}
+    out["p"] += [Art(u, "Steam") for u in steam_urls(steam, ["library_capsule_2x", "library_capsule"])]
+    out[""] += [Art(u, "Steam") for u in steam_urls(steam, ["header_2x", "header"])]
+    out["_hero"] += [Art(u, "Steam") for u in steam_urls(steam, ["library_hero_2x", "library_hero"])]
+    out["_logo"] += [Art(u, "Steam") for u in steam_logos(steam)]
+    if game:
+        by_type = images_by_type(db, game[0])
+        fanart = [url for _, url in by_type.get("Fanart - Background", [])][:2]
+        logos = [url for _, url in by_type.get("Clear Logo", [])]
+        logo = logos[0] if logos else None
+        out["p"] += [Art(url, "poster", crop=True) for _, url in by_type.get("Poster", [])]
+        # Most PC and disc boxes are close to Steam's 2:3; wide cartridge boxes would lose too much.
+        boxes = [Art(url, "box", crop=True) for _, url in by_type.get("Box - Front", [])[:3]]
+        for box in boxes:
+            probe_size(box)
+        out["p"] += [b for b in boxes if b.size and b.size[0] / b.size[1] <= 0.85]
+        out["p"] += [Art(url, "fanart + logo", crop=True, logo=logo) for url in fanart]
+        out[""] += [Art(url, "fanart + logo", crop=920 / 430, logo=logo) for url in fanart]
+        out["_hero"] += [Art(url, "fanart", crop=1920 / 620) for url in fanart]
+        out["_logo"] += [Art(url, "clear logo") for url in logos[:2]]
+    return out
+
+
+def render_first(options):
+    """Download the first option that works: (bytes, ext) or None."""
+    for art in options:
+        try:
+            return render(art)
+        except (urllib.error.URLError, OSError):
+            continue
+    return None
+
+
+def steam_main(args, steam_text):
+    """Fill in the library art Steam leaves blank for games added with "Add a Non-Steam Game"."""
+    root = Path(os.path.expandvars(os.path.expanduser(steam_text.strip().strip('"')))) if steam_text else find_steam()
+    if not root or not (root / "userdata").is_dir():
+        sys.exit('Couldn\'t find Steam. Point fetchart at its folder: fetchart --steam "D:\\Steam"')
+    accounts = steam_accounts(root)
+    if not accounts:
+        sys.exit("This Steam has no non-Steam games yet. Add some in Steam (Games > Add a Non-Steam Game "
+                 "to My Library), then run this again.")
+    user, who = accounts[choose("Which Steam account?", [a[1] for a in accounts], auto=args.yes)]
+    games = steam_shortcuts(user / "config" / "shortcuts.vdf")
+    grid = user / "config" / "grid"
+
+    def missing(appid):  # never replace art someone already picked
+        return [s for s in STEAM_SLOTS
+                if not any((grid / f"{appid}{s}{ext}").exists() for ext in (".png", ".jpg", ".jpeg", ".webp"))]
+
+    todo = [(appid, name, missing(appid)) for appid, name in games]
+    todo = [t for t in todo if t[2]]
+    print(f"\n{who} has {len(games)} non-Steam game{'s' * (len(games) != 1)}, "
+          f"{len(todo)} of them missing art.")
+    if not todo:
+        return
+    if not args.yes:
+        picks = choose_many("Which games should get art?", [f"{name}  (needs: {', '.join(STEAM_SLOTS[s] for s in slots)})"
+                                                            for _, name, slots in todo])
+        todo = [todo[i] for i in picks]
+    db = open_index(args.update)
+    grid.mkdir(parents=True, exist_ok=True)
+
+    def match(item):  # official Steam art when the game is on Steam; LaunchBox fills whatever Steam lacks
+        conn = sqlite3.connect(DB_PATH)  # sqlite connections can't be shared between threads
+        try:
+            return steam_assets(item[1]), search_games(conn, item[1], None, None)[:8]
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(6) as pool:
+        matches = list(pool.map(match, todo))
+
+    def save(appid, name, slots, steam, game):
+        art = steam_grid_art(db, game, steam)
+        saved = []
+        for suffix in slots:
+            result = render_first(art[suffix])
+            if result:
+                (grid / f"{appid}{suffix}{result[1]}").write_bytes(result[0])
+                saved.append(STEAM_SLOTS[suffix])
+        source = " + ".join((["Steam"] if steam else []) + ([f"{game[1]} [{game[2]}]"] if game else []))
+        print(f"  {name}: " + (f"saved {', '.join(saved)}  ({source})" if saved else f"no art found ({source})"))
+
+    print()
+    unsure = []
+    for (appid, name, slots), (steam, found) in zip(todo, matches):
+        game = found[0] if found and found[0][5] >= SURE_MATCH else None
+        if steam or game:
+            save(appid, name, slots, steam, game)
+        elif found:
+            unsure.append((appid, name, slots, found))
+        else:
+            print(f"  {name}: no match")
+    if unsure and not args.yes:
+        print(f"\n{len(unsure)} {'was' if len(unsure) == 1 else 'were'}n't a sure match. Pick the right game:")
+        for appid, name, slots, found in unsure:
+            pick = choose(f'Which game is "{name}"?', [f"{g[1]}  [{platform_label(g)}]" for g in found]
+                          + ["Skip this one", "Skip the rest"])
+            if pick == len(found) + 1:
+                break
+            if pick < len(found):
+                save(appid, name, slots, {}, found[pick])
+    elif unsure:
+        print(f"Skipped {len(unsure)} that weren't a sure match. Run without -y to pick by hand.")
+    print("\nDone. Restart Steam to see the new art.")
 
 
 # ---------------------------------------------------------------- main
@@ -1561,15 +2048,22 @@ def main():
     p.add_argument("game", nargs="?", help='name, e.g. halo-combat-evolved or "the dark side of the moon"')
     p.add_argument("platform", nargs="?",
                    help="pc, xbox, x360, ps2, n64, gc, wii, switch, gba, ... (default: all), or movie, tv, album, painting")
-    p.add_argument("-t", "--type", choices=list(ART_TYPES), help="box, clean (no logo), logo, icon, or ach (360 achievements)")
+    p.add_argument("-t", "--type", choices=list(ART_TYPES),
+                   help="box, clean (no logo), logo, clearlogo, icon, ach (achievements / trophies), or wallpaper")
     p.add_argument("-r", "--orient", choices=["portrait", "landscape"], help="key art orientation")
     p.add_argument("-q", "--quality", help="low, medium, high, all, or an exact size like 1920x1080")
     p.add_argument("-o", "--out", help="folder to save into")
     p.add_argument("-y", "--yes", action="store_true", help="take the top match and defaults, no prompts")
-    p.add_argument("-f", "--folder", help="get art for every game in this folder, named after each ROM file")
+    p.add_argument("-w", "--wallpaper", action="store_true", help="set the picture as your desktop wallpaper")
+    p.add_argument("-f", "--folder", help="get art for every game in this folder, named after each ROM file "
+                                          "(or posters for a folder of movies and shows)")
+    p.add_argument("--steam", nargs="?", const="", metavar="STEAM_DIR",
+                   help="add library art to the non-Steam games in Steam")
     p.add_argument("--update", action="store_true", help="re-download the game database")
     p.add_argument("--version", action="version", version=f"fetchart {__version__}")
     args = p.parse_args()
+    if args.steam is not None:
+        return steam_main(args, args.steam)
     if args.folder:
         args.platform = args.platform or args.game  # fetchart --folder D:\ROMs n64
         try:
@@ -1587,6 +2081,8 @@ def main():
     else:
         category = MEDIA.get(re.sub(r"[^a-z]", "", (args.platform or "").lower()), "game")
     cfg = load_config()
+    if category == "steam":
+        return steam_main(args, "")
     while True:
         if interactive:
             args.game = ask("\n" + CATEGORIES[category][1])
@@ -1594,8 +2090,8 @@ def main():
                 return
         query = re.sub(r"[-_]+", " ", args.game).strip()
         try:
-            if category == "folder":
-                return folder_main(args, args.game, cfg)
+            if category in ("folder", "videos"):
+                return folder_main(args, args.game, cfg, videos=category == "videos")
             if category == "game":
                 return game_main(args, query, cfg)
             if category == "painting":
@@ -1610,12 +2106,15 @@ def main():
 def game_main(args, query, cfg):
     db = open_index(args.update)
     platform = resolve_platform(db, args.platform)
-    if args.type == "ach":
-        if platform not in (None, XBOX360):
-            sys.exit("Achievement icons are only for Xbox 360 games (platform x360).")
-        platform = XBOX360
+    if args.wallpaper and args.type not in ("clean", "logo"):
+        args.type = "wallpaper"
+    if args.type == "ach" and platform and platform not in ACH_SOURCES:
+        sys.exit(f"fetchart can't find achievements for {platform} games.")
 
-    groups = group_games(search_games(db, query, platform, args.type), split_year(query)[1])
+    found = search_games(db, query, platform, args.type)
+    if args.type == "ach":
+        found = [g for g in found if g[2] in ACH_SOURCES]
+    groups = group_games(found, split_year(query)[1])
     if not groups:
         what = ART_TYPES[args.type].lower() if args.type else "game"
         where = f" on {platform}" if platform else ""
@@ -1624,10 +2123,15 @@ def game_main(args, query, cfg):
     gid, title, plat = group[choose(f"Which platform is {group[0][1]} on?",
                                     [platform_label(g) for g in group], auto=args.yes)][:3]
 
-    kinds = [k for k in ART_TYPES if k != "ach" or plat == XBOX360]
+    kinds = [k for k in ART_TYPES if k != "ach" or plat in ACH_SOURCES]
+    labels = [f"{ach_word(plat).title()} icons (pick any or all)" if k == "ach" else ART_TYPES[k] for k in kinds]
+    wallpaper_flag = args.wallpaper
     while True:
-        kind = args.type or kinds[choose("What art do you want?", [ART_TYPES[k] for k in kinds], auto=args.yes)]
+        kind = args.type or kinds[choose("What art do you want?", labels, auto=args.yes)]
         orient = args.orient
+        args.wallpaper = wallpaper_flag or kind == "wallpaper"
+        if args.wallpaper:
+            kind, orient = ("clean" if kind == "wallpaper" else kind), "landscape"
         if kind in ("clean", "logo") and not orient:
             orient = ["landscape", "portrait"][choose("Portrait or landscape?", ["Landscape", "Portrait"],
                                                       auto=args.yes)]
@@ -1641,7 +2145,7 @@ def game_main(args, query, cfg):
         if args.type or args.yes:
             sys.exit(missing)
         print(f"{missing} Pick another kind.")
-    tag = {"box": "box art", "clean": "key art", "logo": "key art (logo)", "icon": "icon"}[kind]
+    tag = {"box": "box art", "clean": "key art", "logo": "key art (logo)", "clearlogo": "logo", "icon": "icon"}[kind]
     # Store lookups guess URLs, so for icons drop the ones that didn't resolve to a real image.
     finish(options, f"{title} [{plat}] - {tag}", args, cfg, require_size=kind == "icon")
 
@@ -1655,11 +2159,16 @@ def finish(options, name_prefix, args, cfg, require_size=False):
         options = [o for o in options if o.size]
     if not options:
         sys.exit("Couldn't find any art for that.")
-    options.sort(key=lambda o: -(o.final_size()[0] * o.final_size()[1] if o.final_size() else 0))
+    # Biggest first, but Japanese releases last: their logo and cover text is in Japanese.
+    options.sort(key=lambda o: (o.source.endswith(", Japan"),
+                                -(o.final_size()[0] * o.final_size()[1] if o.final_size() else 0)))
+    if args.wallpaper:  # a 600 MB museum scan makes a poor wallpaper; 4K is plenty
+        options = [o for o in options if not o.final_size() or o.final_size()[0] <= 3840] or options
 
     picked = pick_art(options, args.quality, args.yes, name_prefix)
     folder = pick_folder(args.out, cfg, args.yes)
     print()
+    saved = []
     for art in picked:
         size = art.final_size()
         name = name_prefix + (f" {size[0]}x{size[1]}" if size else "") + f" - {art.source}"
@@ -1670,7 +2179,48 @@ def finish(options, name_prefix, args, cfg, require_size=False):
             continue
         dest = unique_path(folder / (safe_filename(name) + ext))
         dest.write_bytes(data)
+        saved.append(dest)
         print(f"Saved {dest}  ({len(data) // 1024} KB)")
+    if args.wallpaper and saved:
+        if set_wallpaper(saved[0]):
+            print("It's your desktop wallpaper now.")
+        else:
+            print("Couldn't set the wallpaper on this system, but the picture is saved.")
+
+
+def set_wallpaper(path):
+    """Make a picture the desktop background. Returns False when the system isn't supported."""
+    path = Path(path).resolve()
+    if path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".bmp"):  # Windows won't take .webp
+        Image, _ = pil()
+        jpg = path.with_suffix(".jpg")
+        Image.open(path).convert("RGB").save(jpg, quality=95)
+        path = jpg
+    if os.name == "nt":
+        import ctypes
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop", 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "WallpaperStyle", 0, winreg.REG_SZ, "10")  # fill the screen
+            winreg.SetValueEx(key, "TileWallpaper", 0, winreg.REG_SZ, "0")
+        # SPI_SETDESKWALLPAPER, saved to the profile and announced to running programs
+        return bool(ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3))
+    if sys.platform == "darwin":
+        script = f'tell application "System Events" to tell every desktop to set picture to {json.dumps(str(path))}'
+        commands = [["osascript", "-e", script]]
+    else:
+        uri = path.as_uri()
+        commands = [["gsettings", "set", "org.gnome.desktop.background", "picture-uri", uri],
+                    ["gsettings", "set", "org.gnome.desktop.background", "picture-uri-dark", uri],
+                    ["plasma-apply-wallpaperimage", str(path)],
+                    ["xfconf-query", "-c", "xfce4-desktop", "-p",
+                     "/backdrop/screen0/monitor0/workspace0/last-image", "-s", str(path)]]
+    worked = False
+    for cmd in commands:
+        try:
+            worked |= subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        except OSError:  # that desktop's tool isn't installed
+            continue
+    return worked
 
 
 def run():
