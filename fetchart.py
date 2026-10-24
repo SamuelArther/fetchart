@@ -5,12 +5,19 @@ Usage:
     fetchart <game> [platform] [-t TYPE] [-r portrait|landscape] [-q QUALITY] [-o FOLDER] [-y] [-w]
     fetchart --folder DIR [platform] [-t TYPE] [-o FOLDER] [-y]   art for every ROM in a folder
     fetchart --folder DIR movie|tv [-y]                           posters for a folder of movies or shows
+    fetchart --folder DIR [-y]                                    cover.jpg for every album in a music folder
     fetchart --steam [STEAM_DIR] [-y]                             Steam library art for non-Steam games
+    fetchart --collage DIR [-w]                                   a box wall: one poster of every cover
+    fetchart --list FILE [-t TYPE] [-o FOLDER]                    art for every name in a text file
+    fetchart --daily [GAMES | PLATFORM | off]                     a new game wallpaper every day
     fetchart --undo-wallpaper    put back the wallpaper from before -w
+    fetchart --completion powershell|bash|zsh                     Tab completion for your shell
     fetchart --update            re-download the game database
 
 Art types:
     box        box cover art, rating and all         (LaunchBox box fronts, every region)
+    back, box3d, disc, screenshot, flyer             (back covers, 3D boxes, discs and cartridges,
+                                                      screenshots, old magazine ads: LaunchBox)
     clean      key art without the logo              (LaunchBox fanart backgrounds, Steam library hero)
     logo       key art with the logo                 (Steam capsules, LaunchBox banners/posters, or
                                                       fanart with the game's clear logo laid on top)
@@ -21,6 +28,9 @@ Art types:
                                                       from Exophase; Xbox 360 originals from Xbox Live)
 
 -w / --wallpaper saves the best landscape key art (or painting) and sets it as the desktop background.
+-r picks the key art shape: landscape, portrait, phone, ultrawide (21:9) or superwide (32:9).
+
+Also: pokemon, minecraft (a player's skin), anime, manga, book and app work in place of a platform.
 
 Short names work: mw2, botw, gta5, ff7, "mw2 remastered". Add a year for remakes: "mw2 2009".
 
@@ -60,7 +70,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 UA = {"User-Agent": f"fetchart/{__version__} (+https://github.com/SamuelArther/fetchart)"}
 LB_DUMP = "https://gamesdb.launchbox-app.com/Metadata.zip"
@@ -71,11 +81,22 @@ DB_PATH = DATA_DIR / "launchbox.db"
 CONFIG = Path(os.environ.get("APPDATA") or os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "fetchart" / "config.json"
 DB_MAX_AGE = 30 * 86400
 
-KEEP_TYPES = {"Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front",
-              "Fanart - Background", "Clear Logo", "Banner", "Poster", "Square", "Icon"}
-DB_SCHEMA = 4  # bump when KEEP_TYPES or the table layout changes, to force a rebuild
+SCREENSHOT_TYPES = ("Screenshot - Gameplay", "Screenshot - Game Title", "Screenshot - Game Select",
+                    "Screenshot - High Scores", "Screenshot - Game Over")
+BACK_TYPES = ("Box - Back", "Box - Back - Reconstructed", "Fanart - Box - Back")
+MEDIA_TYPES = ("Disc", "Cart - Front", "Cart - 3D", "Cart - Back", "Fanart - Disc", "Fanart - Cart - Front")
+FLYER_TYPES = ("Advertisement Flyer - Front", "Advertisement Flyer - Back")
+KEEP_TYPES = {"Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front", "Box - 3D",
+              "Fanart - Background", "Clear Logo", "Banner", "Poster", "Square", "Icon",
+              *SCREENSHOT_TYPES, *BACK_TYPES, *MEDIA_TYPES, *FLYER_TYPES}
+DB_SCHEMA = 5  # bump when KEEP_TYPES or the table layout changes, to force a rebuild
 NEEDED_TYPES = {
     "box": ("Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front"),
+    "back": BACK_TYPES,
+    "box3d": ("Box - 3D",),
+    "disc": MEDIA_TYPES,
+    "screenshot": SCREENSHOT_TYPES,
+    "flyer": FLYER_TYPES,
     "clean": ("Fanart - Background",),
     "logo": ("Fanart - Background", "Banner", "Poster"),
     "clearlogo": ("Clear Logo",),
@@ -86,12 +107,25 @@ NEEDED_TYPES = {
 }
 ART_TYPES = {
     "box": "Box cover art (the retail cover, rating and all)",
+    "back": "Back of the box",
+    "box3d": "3D box (the whole box at an angle)",
+    "disc": "Disc or cartridge",
+    "screenshot": "Screenshots (gameplay and title screen)",
+    "flyer": "Old magazine / store ad flyers",
     "clean": "Key art, no logo",
     "logo": "Key art, with logo",
     "clearlogo": "Clear logo (just the logo, see-through background)",
     "icon": "Dashboard icon / tile (the square on the console menu)",
     "ach": "Achievement icons (pick any or all)",
     "wallpaper": "Desktop wallpaper (the best key art, set as your background)",
+}
+# Shapes for key art: menu text -> crop (None = as is, True = 2:3 portrait, else width / height).
+ORIENTS = {
+    "landscape": ("Landscape", None),
+    "portrait": ("Portrait", True),
+    "phone": ("Phone wallpaper (tall)", 9 / 19.5),
+    "ultrawide": ("Ultrawide monitor (21:9)", 21 / 9),
+    "superwide": ("Super ultrawide / two monitors (32:9)", 32 / 9),
 }
 XBOX360 = "Microsoft Xbox 360"
 REGION_ORDER = ["North America", "United States", "World", None, "Canada", "Europe", "United Kingdom",
@@ -137,10 +171,63 @@ class NotFound(Exception):
     """A search came up empty. The menus ask for another name; the command line exits."""
 
 
-def http_get(url, headers=None, timeout=30):
+BIG_DOWNLOAD = 8 << 20  # bytes; bigger single downloads get a progress bar
+
+
+def http_get(url, headers=None, timeout=30, progress=False):
     req = urllib.request.Request(url, headers={**UA, **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+        total = int(r.headers.get("Content-Length") or 0)
+        if not (progress and total >= BIG_DOWNLOAD):
+            return r.read()
+        bar, chunks, done = Progress(total, "  Downloading", megabytes=True), [], 0
+        while chunk := r.read(1 << 18):
+            chunks.append(chunk)
+            done += len(chunk)
+            bar.update(done)
+        bar.close()
+        return b"".join(chunks)
+
+
+class Progress:
+    """A progress bar on the last console line, redrawn in place. Lines printed through log() go above it.
+    When the output isn't a console it draws nothing and log() just prints."""
+
+    def __init__(self, total, label="", megabytes=False):
+        self.total, self.label, self.megabytes = max(total, 1), label, megabytes
+        self.done, self.extra, self.lock = 0, "", threading.Lock()
+        self.live = sys.stdout.isatty()
+        if self.live:
+            enable_ansi()
+
+    def _draw(self):
+        if not self.live:
+            return
+        filled = round(24 * min(self.done, self.total) / self.total)
+        count = (f"{self.done / 2 ** 20:.0f} of {self.total / 2 ** 20:.0f} MB" if self.megabytes
+                 else f"{self.done} of {self.total}")
+        line = f"{self.label} [{'#' * filled}{'-' * (24 - filled)}] {count}" + (f"  {self.extra}" if self.extra else "")
+        sys.stdout.write("\r\x1b[2K" + line[:shutil.get_terminal_size().columns - 1])
+        sys.stdout.flush()
+
+    def update(self, done=None, extra=None, step=0):
+        with self.lock:
+            self.done = (self.done if done is None else done) + step
+            self.extra = self.extra if extra is None else extra
+            self._draw()
+
+    def log(self, line):
+        with self.lock:
+            if self.live:
+                sys.stdout.write("\r\x1b[2K")
+            print(line)
+            self._draw()
+
+    def close(self):
+        with self.lock:
+            if self.live:
+                sys.stdout.write("\r\x1b[2K")
+                sys.stdout.flush()
 
 
 def get_json(url, params):
@@ -509,14 +596,12 @@ def build_index():
     print("Downloading the LaunchBox game database (~110 MB, only needed once a month)...")
     req = urllib.request.Request(LB_DUMP, headers=UA)
     with urllib.request.urlopen(req, timeout=60) as r, open(zip_path, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
+        bar = Progress(int(r.headers.get("Content-Length") or 0), "  Downloading", megabytes=True)
         while chunk := r.read(1 << 20):
             f.write(chunk)
-            done += len(chunk)
-            if total:
-                print(f"\r  {done * 100 // total}%", end="", flush=True)
-    print("\nIndexing...")
+            bar.update(step=len(chunk))
+        bar.close()
+    print("Indexing (about 20 seconds)...")
 
     tmp = DB_PATH.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)
@@ -1035,9 +1120,11 @@ class Art:
     """One downloadable option. crop = cut to 2:3 portrait (True) or to this width/height ratio;
     logo = clear-logo URL to lay on top; scale = resize a small square icon up to this many pixels."""
 
-    def __init__(self, url, source, crop=False, logo=None, scale=None, preview=None):
+    def __init__(self, url, source, crop=False, logo=None, scale=None, preview=None, data=None, pixelated=False):
         self.url, self.source, self.crop, self.logo, self.scale = url, source, crop, logo, scale
         self.preview = preview  # a smaller copy to show in the browser preview, when the original is huge
+        self.data = data  # the image itself, for pictures fetchart makes (url is then None)
+        self.pixelated = pixelated  # scale pixel art up with hard edges
         self.size = None
         self.fingerprint = None
 
@@ -1064,6 +1151,9 @@ def crop_size(size, crop):
 
 def probe_size(art):
     Image, _ = pil()
+    if art.data:
+        art.size, art.fingerprint = Image.open(io.BytesIO(art.data)).size, hash(art.data)
+        return
     for span in (65535, 524287):
         try:
             head = http_get(art.url, {"Range": f"bytes=0-{span}"})
@@ -1107,6 +1197,25 @@ def gather(db, gid, title, platform, kind, orient):
         for _, url in by_type.get("Fanart - Box - Front", []):
             out.append(Art(url, "fan-made box"))
         return out
+    labelled = {  # kind -> [(LaunchBox type, label)]
+        "back": [("Box - Back", "back of the box"), ("Box - Back - Reconstructed", "rebuilt back"),
+                 ("Fanart - Box - Back", "fan-made back")],
+        "box3d": [("Box - 3D", "3D box")],
+        "disc": [("Disc", "disc"), ("Cart - Front", "cartridge"), ("Cart - 3D", "3D cartridge"),
+                 ("Cart - Back", "back of the cartridge"), ("Fanart - Disc", "fan-made disc"),
+                 ("Fanart - Cart - Front", "fan-made cartridge")],
+        "screenshot": [("Screenshot - Gameplay", "gameplay"), ("Screenshot - Game Title", "title screen"),
+                       ("Screenshot - Game Select", "select screen"), ("Screenshot - High Scores", "high scores"),
+                       ("Screenshot - Game Over", "game over")],
+        "flyer": [("Advertisement Flyer - Front", "ad flyer"), ("Advertisement Flyer - Back", "back of the ad flyer")],
+    }
+    if kind in labelled:
+        for image_type, label in labelled[kind]:
+            images = by_type.get(image_type, [])
+            for i, (region, url) in enumerate(images, 1):
+                number = f" #{i}" if len(images) > 1 and image_type.startswith("Screenshot") else ""
+                out.append(Art(url, label + number + (f", {region}" if region else "")))
+        return out
 
     steam = steam_assets(title)
     if kind == "clearlogo":
@@ -1115,28 +1224,34 @@ def gather(db, gid, title, platform, kind, orient):
         for region, url in by_type.get("Clear Logo", []):
             out.append(Art(url, f"clear logo, {region}" if region else "clear logo"))
         return out
+    crop = ORIENTS.get(orient or "landscape", ORIENTS["landscape"])[1]
+    cut = "" if not crop else ", cropped" if crop is True else f", cropped to {orient}"
     if kind == "clean":
         for url in steam_urls(steam, ["library_hero_2x", "library_hero"]):
-            out.append(Art(url, "Steam hero (official)" + (", cropped" if portrait else ""), crop=portrait))
+            out.append(Art(url, "Steam hero (official)" + cut, crop=crop))
         for i, url in enumerate(fanart, 1):
-            out.append(Art(url, f"fanart #{i}" + (", cropped" if portrait else ""), crop=portrait))
+            out.append(Art(url, f"fanart #{i}" + cut, crop=crop))
         return out
 
     # kind == "logo"
-    if portrait:
+    if crop and crop is not True and crop < 1:  # phone: the tall official covers, cut down
+        for url in steam_urls(steam, ["library_capsule_2x", "library_capsule"]):
+            out.append(Art(url, "Steam cover (official)" + cut, crop=crop))
+        for _, url in by_type.get("Poster", []):
+            out.append(Art(url, "poster" + cut, crop=crop))
+    elif portrait:
         for url in steam_urls(steam, ["library_capsule_2x", "library_capsule"]):
             out.append(Art(url, "Steam cover (official)"))
         for _, url in by_type.get("Poster", []):
             out.append(Art(url, "poster"))
-    else:
+    elif not crop:
         for url in steam_urls(steam, ["header_2x", "header", "main_capsule"]):
             out.append(Art(url, "Steam header (official)"))
         for _, url in by_type.get("Banner", []):
             out.append(Art(url, "banner"))
     if logos:
         for i, url in enumerate(fanart, 1):
-            out.append(Art(url, f"fanart #{i} + logo" + (", cropped" if portrait else ""),
-                           crop=portrait, logo=logos[0]))
+            out.append(Art(url, f"fanart #{i} + logo" + cut, crop=crop, logo=logos[0]))
     return out
 
 
@@ -1162,16 +1277,18 @@ def image_ext(data):
     return ".jpg"
 
 
-def render(art):
-    """Download one option and apply its crop / logo overlay. Returns (bytes, extension)."""
-    data = http_get(art.url, timeout=90)
+def render(art, progress=False):
+    """Download one option and apply its crop / logo overlay. Returns (bytes, extension).
+    progress shows a bar for big downloads (only from the main thread, one at a time)."""
+    data = art.data or http_get(art.url, timeout=90, progress=progress)
     ext = image_ext(data)
     if not art.crop and not art.logo and not art.scale:
         return data, ext
     Image, ImageFilter = pil()
     if art.scale:
         buf = io.BytesIO()
-        Image.open(io.BytesIO(data)).convert("RGBA").resize((art.scale, art.scale), Image.LANCZOS).save(buf, "PNG")
+        resample = Image.NEAREST if art.pixelated else Image.LANCZOS
+        Image.open(io.BytesIO(data)).convert("RGBA").resize((art.scale, art.scale), resample).save(buf, "PNG")
         return buf.getvalue(), ".png"
     img = Image.open(io.BytesIO(data)).convert("RGB")
     w, h = img.size
@@ -1199,17 +1316,31 @@ def render(art):
 
 MEDIA = {"movie": "movie", "movies": "movie", "film": "movie", "tv": "tv", "show": "tv", "tvshow": "tv",
          "album": "album", "music": "album", "cd": "album", "song": "album",
-         "painting": "painting", "paintings": "painting", "art": "painting", "artwork": "painting"}
+         "painting": "painting", "paintings": "painting", "art": "painting", "artwork": "painting",
+         "pokemon": "pokemon", "minecraft": "minecraft", "mc": "minecraft",
+         "skin": "minecraft", "anime": "anime", "manga": "manga", "book": "book", "books": "book",
+         "app": "app", "apps": "app", "ios": "app"}
 # Top menu when fetchart is run with no arguments: key -> (menu text, name prompt)
 CATEGORIES = {
     "game": ("Video game", "Game name: "),
     "screen": ("Movie or TV show", "Movie or show name: "),
     "album": ("Music (album cover)", "Album (artist + album name works best): "),
     "painting": ("Painting / real art", "Painting name (add the artist if you know it): "),
+    "pokemon": ("Pokémon", "Pokémon name: "),
+    "minecraft": ("Minecraft skin (by player name)", "Minecraft player name: "),
+    "anime": ("Anime or manga", "Anime or manga name: "),
+    "book": ("Book cover", "Book title (add the author if you know it): "),
+    "app": ("App icon (App Store)", "App name: "),
     "folder": ("A whole folder of games (art for every ROM)", "Folder with your games (paste its path): "),
     "videos": ("A whole folder of movies or TV shows (posters for Plex, Jellyfin, Kodi)",
                "Folder with your movies or shows (paste its path): "),
+    "musicfolder": ("A whole folder of music (cover.jpg for every album)", "Folder with your music (paste its path): "),
+    "collage": ("Box wall: one big poster of every cover in a folder",
+                "Folder with the covers (or your ROMs) (paste its path): "),
     "steam": ("Steam: art for my non-Steam games", None),
+    "daily": ("Daily wallpaper: a new game every day",
+              'Games, or a platform (like "halo 3, celeste, elden ring" or "n64"; Enter = popular games): '),
+    "list": ("A list of names in a text file (one per line)", "Text file (paste its path): "),
 }
 TV_TYPES = {"tvSeries", "tvMiniSeries"}
 
@@ -1368,6 +1499,277 @@ def painting_main(args, query, cfg):
     finish(options, f"{page['title']} - {page.get('description') or 'artwork'}", args, cfg, require_size=True)
 
 
+# ---------------------------------------------------------------- Minecraft skins
+
+def mc_part(skin, box, scale):
+    """One rectangle of a skin texture, scaled up with hard pixel edges."""
+    Image, _ = pil()
+    part = skin.crop(box)
+    return part.resize((part.width * scale, part.height * scale), Image.NEAREST)
+
+
+def mc_body(skin, slim, scale=20):
+    """The whole player from the front, hat, jacket and sleeves included."""
+    Image, _ = pil()
+    arm = 3 if slim else 4
+    legacy = skin.height == 32  # pre-1.8 skins have one arm and one leg, mirrored for the other side
+
+    def mirrored(box):
+        return skin.crop(box).transpose(Image.FLIP_LEFT_RIGHT)
+
+    canvas = Image.new("RGBA", (16, 32), (0, 0, 0, 0))
+    layers = [  # (texture box or image, position); the second layer of each part sits on top
+        ((8, 8, 16, 16), (4, 0)), ((20, 20, 28, 32), (4, 8)),
+        ((44, 20, 44 + arm, 32), (4 - arm, 8)), ((4, 20, 8, 32), (4, 20)),
+        (mirrored((44, 20, 44 + arm, 32)) if legacy else (36, 52, 36 + arm, 64), (12, 8)),
+        (mirrored((4, 20, 8, 32)) if legacy else (20, 52, 24, 64), (8, 20)),
+        ((40, 8, 48, 16), (4, 0)),
+    ]
+    if not legacy:
+        layers += [((20, 36, 28, 48), (4, 8)), ((44, 36, 44 + arm, 48), (4 - arm, 8)),
+                   ((52, 52, 52 + arm, 64), (12, 8)), ((4, 36, 8, 48), (4, 20)), ((4, 52, 8, 64), (8, 20))]
+    for box, pos in layers:
+        part = box if isinstance(box, Image.Image) else skin.crop(box)
+        canvas.alpha_composite(part, pos)
+    return canvas.resize((16 * scale, 32 * scale), Image.NEAREST)
+
+
+def iso_cube(top, left, right, size):
+    """A cube seen from above at an angle, three square textures on its faces: (image, (top, left)).
+    left is the face toward the viewer's left, right the other side; edges are size pixels long."""
+    Image, _ = pil()
+    from PIL import ImageEnhance
+    a, b = size * math.cos(math.pi / 6), size / 2
+    w, h = math.ceil(2 * a), math.ceil(2 * b + size)
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    t0, t2, t3 = (a, 0), (a, 2 * b), (0, b)  # the top face's back, front and left corners
+    for tex, origin, e1, e2, light in ((top, t0, (a, b), (-a, b), 1.0),
+                                       (left, t3, (a, b), (0, size), 0.85),
+                                       (right, t2, (a, -b), (0, size), 0.7)):
+        n = tex.width
+        det = e1[0] * e2[1] - e1[1] * e2[0]
+        # The affine map takes each canvas point to the texture point: invert [e1 e2], scaled to the texture.
+        i11, i12, i21, i22 = e2[1] / det * n, -e2[0] / det * n, -e1[1] / det * n, e1[0] / det * n
+        face = tex.transform((w, h), Image.AFFINE,
+                             (i11, i12, -(i11 * origin[0] + i12 * origin[1]),
+                              i21, i22, -(i21 * origin[0] + i22 * origin[1])), Image.NEAREST)
+        if light < 1:
+            alpha = face.getchannel("A")
+            face = ImageEnhance.Brightness(face).enhance(light)
+            face.putalpha(alpha)
+        canvas.alpha_composite(face)
+    return canvas
+
+
+def mc_head(skin, size=256):
+    """The head as a 3D cube, the hat layer floating just outside it."""
+    Image, _ = pil()
+    k = size // 8
+
+    def faces(x, y):  # the head's top, front and left side, from the texture block starting at (x, y)
+        return (mc_part(skin, (x + 8, y, x + 16, y + 8), k), mc_part(skin, (x + 8, y + 8, x + 16, y + 16), k),
+                mc_part(skin, (x + 16, y + 8, x + 24, y + 16), k))
+
+    hat = iso_cube(*faces(32, 0), round(size * 1.125))
+    head = iso_cube(*faces(0, 0), size)
+    out = Image.new("RGBA", hat.size, (0, 0, 0, 0))
+    out.alpha_composite(head, ((hat.width - head.width) // 2, (hat.height - head.height) // 2))
+    out.alpha_composite(hat)
+    return out
+
+
+def mc_skin(raw):
+    """Open a skin the way Minecraft reads it: the base layers are always solid, and an old 64x32 skin whose
+    hat layer has no see-through pixel at all (most were saved without transparency) has no hat."""
+    Image, _ = pil()
+    skin = Image.open(io.BytesIO(raw)).convert("RGBA")
+    solid = [(0, 0, 32, 16), (0, 16, 64, 32)] + ([(16, 48, 48, 64)] if skin.height == 64 else [])
+    for box in solid:
+        part = skin.crop(box)
+        part.putalpha(255)
+        skin.paste(part, box[:2])
+    if skin.height == 32 and skin.crop((32, 0, 64, 16)).getchannel("A").getextrema()[0] == 255:
+        skin.paste((0, 0, 0, 0), (32, 0, 64, 16))
+    return skin
+
+
+def png_bytes(img):
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def minecraft_main(args, query, cfg):
+    """A player's skin, cape, face, full body and a 3D head, from Mojang's servers."""
+    name = re.sub(r"\s+", "", query)
+    print(f'Looking up the Minecraft player "{name}"...')
+    try:
+        profile = get_json(f"https://api.mojang.com/users/profiles/minecraft/{urllib.parse.quote(name)}", {})
+        session = get_json(f"https://sessionserver.mojang.com/session/minecraft/profile/{profile['id']}", {})
+        textures = json.loads(base64.b64decode(session["properties"][0]["value"]))["textures"]
+    except urllib.error.HTTPError as e:
+        if e.code in (204, 404):
+            raise NotFound(f'No Minecraft player is called "{name}".')
+        sys.exit(f"Network error: {e}")
+    except (urllib.error.URLError, ValueError, KeyError) as e:
+        sys.exit(f"Network error: {e}")
+    if "SKIN" not in textures:
+        raise NotFound(f"{profile['name']} uses a default skin, so there's no skin to download.")
+    Image, _ = pil()
+    raw = http_get(textures["SKIN"]["url"].replace("http://", "https://"))
+    skin = mc_skin(raw)
+    slim =textures["SKIN"].get("metadata", {}).get("model") == "slim"
+    face = mc_part(skin, (8, 8, 16, 16), 64)
+    face.alpha_composite(mc_part(skin, (40, 8, 48, 16), 64))
+    options = [Art(None, "3D head", data=png_bytes(mc_head(skin))),
+               Art(None, "full body, front" + (" (slim arms)" if slim else ""), data=png_bytes(mc_body(skin, slim))),
+               Art(None, "face", data=png_bytes(face)),
+               Art(None, "skin file (load it into Minecraft or a skin editor)", data=raw)]
+    if "CAPE" in textures:
+        cape = Image.open(io.BytesIO(http_get(textures["CAPE"]["url"].replace("http://", "https://")))).convert("RGBA")
+        options += [Art(None, "cape", data=png_bytes(mc_part(cape, (1, 1, 11, 17), 32))),
+                    Art(None, "cape file", data=png_bytes(cape))]
+    finish(options, f"{profile['name']} - Minecraft", args, cfg)
+
+
+# ---------------------------------------------------------------- Pokémon, anime, books and apps
+
+def post_json(url, payload):
+    req = urllib.request.Request(url, json.dumps(payload).encode(),
+                                 {**UA, "Content-Type": "application/json", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def pokemon_names():
+    """Every Pokémon and form PokéAPI knows ("pikachu", "charizard-mega-x"), cached for a month."""
+    path = DATA_DIR / "pokemon.json"
+    if path.exists() and time.time() - path.stat().st_mtime < DB_MAX_AGE:
+        return json.loads(path.read_text(encoding="utf-8"))
+    names = [p["name"] for p in get_json("https://pokeapi.co/api/v2/pokemon", {"limit": 5000})["results"]]
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(names), encoding="utf-8")
+    return names
+
+
+def pokemon_main(args, query, cfg):
+    """Official artwork, HOME renders, animated sprites and every game's sprite, shiny ones too."""
+    try:
+        names = pokemon_names()
+    except (urllib.error.URLError, ValueError) as e:
+        sys.exit(f"Network error: {e}")
+    q = norm(query)
+    ranked = sorted(names, key=lambda n: (norm(n) != q, not norm(n).startswith(q), -score(query, n.replace("-", " "))))
+    ranked = [n for n in ranked if norm(n).startswith(q) or score(query, n.replace("-", " ")) >= 0.6][:12]
+    if not ranked:
+        raise NotFound(f'No Pokémon called "{query}".')
+    name = ranked[choose("Which Pokémon?", [n.replace("-", " ").title() for n in ranked], auto=args.yes)]
+    data = get_json(f"https://pokeapi.co/api/v2/pokemon/{name}", {})
+    sprites, title = data["sprites"], name.replace("-", " ").title()
+    print(f"Finding art for {title}...")
+    other = sprites.get("other", {})
+    options = []
+    for key, label in (("official-artwork", "official artwork"), ("home", "Pokémon HOME render")):
+        for shiny in ("", "_shiny"):
+            url = other.get(key, {}).get("front" + (shiny or "_default"))
+            if url:
+                options.append(Art(url, label + (", shiny" if shiny else "")))
+    for shiny in ("", "_shiny"):
+        url = other.get("showdown", {}).get("front" + (shiny or "_default"))
+        if url:
+            options.append(Art(url, "animated (Showdown)" + (", shiny" if shiny else "")))
+    for generation, games in sprites.get("versions", {}).items():
+        gen = generation.replace("generation-", "Gen ").replace("-", " ").upper().replace("GEN", "Gen")
+        for game, pics in games.items():
+            for shiny in ("", "_shiny"):
+                url = pics.get("front" + (shiny or "_default"))
+                if url and not url.endswith(".gif"):
+                    options.append(Art(url, f"{gen} sprite, {game.replace('-', ' ')}" + (", shiny" if shiny else ""),
+                                       pixelated=True))
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(probe_size, options))
+    for art in options:  # old games' sprites are tiny: 4x with hard pixel edges, still below the official art
+        if art.pixelated and art.size and art.size[0] <= 128:
+            art.scale = art.size[0] * 4
+            art.source += ", scaled up"
+    finish(options, f"{title} - Pokémon", args, cfg, require_size=True)
+
+
+def anime_main(args, query, cfg, kind=None):
+    """Covers and banners from AniList. kind is ANIME, MANGA or None for both."""
+    print(f'Searching AniList for "{query}"...')
+    gql = ("query($s:String,$t:MediaType){Page(perPage:12){media(search:$s,type:$t,sort:SEARCH_MATCH)"
+           "{type format seasonYear startDate{year} title{romaji english} coverImage{extraLarge} bannerImage}}}")
+    try:
+        variables = {"s": query, **({"t": kind} if kind else {})}  # a null type matches nothing
+        found = post_json("https://graphql.anilist.co", {"query": gql, "variables": variables})
+        media = found["data"]["Page"]["media"]
+    except (urllib.error.URLError, ValueError, KeyError) as e:
+        sys.exit(f"Network error: {e}")
+    if not media:
+        raise NotFound(f'Nothing on AniList for "{query}".')
+
+    def label(m):
+        title = m["title"]["english"] or m["title"]["romaji"]
+        year = m.get("seasonYear") or (m.get("startDate") or {}).get("year") or "?"
+        return f"{title}  ({year})  [{m['type'].lower()}, {(m.get('format') or '').replace('_', ' ').lower()}]"
+
+    m = media[choose("Which one?", [label(m) for m in media], auto=args.yes)]
+    title = m["title"]["english"] or m["title"]["romaji"]
+    options = [Art(m["coverImage"]["extraLarge"], "AniList cover")]
+    if m.get("bannerImage"):
+        options.append(Art(m["bannerImage"], "AniList banner"))
+    finish(options, f"{title} - {m['type'].lower()}", args, cfg, require_size=True)
+
+
+def book_main(args, query, cfg):
+    """Book covers from Open Library: the main cover and other editions' covers."""
+    print(f'Searching Open Library for "{query}"...')
+    try:
+        docs = get_json("https://openlibrary.org/search.json",
+                        {"q": query, "limit": 12, "fields": "key,title,author_name,first_publish_year,cover_i"})["docs"]
+    except (urllib.error.URLError, ValueError, KeyError) as e:
+        sys.exit(f"Network error: {e}")
+    docs = [d for d in docs if d.get("cover_i")]
+    if not docs:
+        raise NotFound(f'No book with a cover found for "{query}". Try the title and author.')
+    doc = docs[choose("Which book?", [f"{d['title']}  -  {', '.join(d.get('author_name', ['?'])[:2])}"
+                                      f"  ({d.get('first_publish_year', '?')})" for d in docs], auto=args.yes)]
+    print(f"Finding covers for {doc['title']}...")
+    ids = [doc["cover_i"]]
+    try:
+        ids += get_json(f"https://openlibrary.org{doc['key']}.json", {}).get("covers", [])
+        for edition in get_json(f"https://openlibrary.org{doc['key']}/editions.json", {"limit": 40}).get("entries", []):
+            ids += edition.get("covers", [])
+    except (urllib.error.URLError, ValueError):
+        pass
+    ids = [i for i in dict.fromkeys(ids) if i and i > 0][:16]
+    options = [Art(f"https://covers.openlibrary.org/b/id/{i}-L.jpg", "cover" if n == 0 else f"edition cover #{n}")
+               for n, i in enumerate(ids)]
+    author = (doc.get("author_name") or [""])[0]
+    finish(options, f"{doc['title']}" + (f" - {author}" if author else "") + " - book cover", args, cfg,
+           require_size=True)
+
+
+def app_main(args, query, cfg):
+    """App Store icons (the 1024px original) and screenshots."""
+    print(f'Searching the App Store for "{query}"...')
+    try:
+        apps = get_json("https://itunes.apple.com/search", {"term": query, "entity": "software", "limit": 12,
+                                                            "country": "US"}).get("results", [])
+    except (urllib.error.URLError, ValueError) as e:
+        sys.exit(f"Network error: {e}")
+    if not apps:
+        raise NotFound(f'No app found for "{query}".')
+    app = apps[choose("Which app?", [f"{a['trackName']}  -  {a.get('sellerName', '?')}" for a in apps], auto=args.yes)]
+    icon = app["artworkUrl512"].rsplit("/", 1)[0]
+    options = [Art(icon + "/1024x1024bb.png", "App Store icon (PNG)"), Art(icon + "/1024x1024bb.jpg", "App Store icon (JPG)")]
+    for n, url in enumerate(app.get("screenshotUrls", []) + app.get("ipadScreenshotUrls", []), 1):
+        # The listed copies are thumbnails; asking for a huge size gets the original.
+        options.append(Art(re.sub(r"/\d+x\d+bb\.(png|jpg)$", "/9999x9999bb.png", url), f"screenshot #{n}"))
+    finish(options, f"{app['trackName']} - app", args, cfg, require_size=True)
+
+
 # ---------------------------------------------------------------- whole folders of games
 
 # File extensions that only one system uses -> LaunchBox platform names. Disc images (.iso, .chd, .cue)
@@ -1399,7 +1801,10 @@ REGION_TAGS = {"usa": "North America", "us": "North America", "world": "World", 
                "eu": "Europe", "uk": "United Kingdom", "japan": "Japan", "jp": "Japan", "australia": "Australia",
                "canada": "Canada", "germany": "Germany", "france": "France", "spain": "Spain", "italy": "Italy",
                "korea": "Korea", "brazil": "Brazil"}
-FOLDER_SUBDIRS = {"box": "covers", "clean": "fanart", "logo": "keyart", "clearlogo": "marquees", "icon": "icons"}
+# Art type -> subfolder, named the way ES-DE names its media folders where it has one.
+FOLDER_SUBDIRS = {"box": "covers", "back": "backcovers", "box3d": "3dboxes", "disc": "physicalmedia",
+                  "screenshot": "screenshots", "clean": "fanart", "logo": "keyart", "clearlogo": "marquees",
+                  "icon": "icons", "flyer": "flyers"}
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".webm", ".mpg", ".mpeg", ".divx"}
 SURE_MATCH = 1.0  # name match needed to save without asking (1.3 = exactly the same name)
 
@@ -1470,14 +1875,19 @@ def fetch_best(game, kind, orient, region, cache, lock):
     return result
 
 
-def folder_main(args, folder_text, cfg, videos=False):
-    """Art for every game in a folder, saved under each ROM's own file name, as emulator frontends expect."""
+def folder_main(args, folder_text, cfg, mode=None):
+    """Art for every game in a folder, saved under each ROM's own file name, as emulator frontends expect.
+    Folders of movies, shows or music (mode "videos" / "musicfolder", or worked out) get posters or covers."""
     folder = Path(os.path.expandvars(os.path.expanduser(folder_text.strip().strip('"').strip("'"))))
     if not folder.is_dir():
         raise NotFound(f"There's no folder at {folder}.")
-    media = MEDIA.get(re.sub(r"[^a-z]", "", (args.platform or "").lower()))
-    if videos or media in ("movie", "tv") or (not args.platform and looks_like_videos(folder)):
+    media = media_word(args.platform)
+    guess = not args.platform and mode in (None, "folder")  # work out what kind of folder it is
+    if mode == "videos" or media in ("movie", "tv") or (guess and looks_like_videos(folder)):
         return video_folder_main(args, folder, media)
+    if (mode == "musicfolder" or media == "album"
+            or (guess and looks_like_music(folder) and not any(p for _, p in scan_folder(folder)))):
+        return music_folder_main(args, folder)
     if args.type and args.type not in FOLDER_SUBDIRS:
         sys.exit(f"-t {args.type} is one game at a time. For folders use: {', '.join(FOLDER_SUBDIRS)}")
     games = scan_folder(folder)
@@ -1496,9 +1906,7 @@ def folder_main(args, folder_text, cfg, videos=False):
     kinds = list(FOLDER_SUBDIRS)
     kind = args.type or kinds[choose("What art do you want for each game?", [ART_TYPES[k] for k in kinds],
                                      auto=args.yes)]
-    orient = args.orient
-    if kind in ("clean", "logo") and not orient:
-        orient = ["landscape", "portrait"][choose("Portrait or landscape?", ["Landscape", "Portrait"], auto=args.yes)]
+    orient = pick_orient(args) if kind in ("clean", "logo") else args.orient
     default = folder / FOLDER_SUBDIRS[kind]
     out = args.out or (str(default) if args.yes else ask(f"\nSave the art to which folder? [Enter = {default}]: ",
                                                           str(default)))
@@ -1522,10 +1930,12 @@ def folder_main(args, folder_text, cfg, videos=False):
     total, width = len(plan), len(str(len(plan)))
     counts = {"saved": 0, "had it": 0, "unsure": 0, "no match": 0, "failed": 0}
     unsure, lock, cache = [], threading.Lock(), {}
+    bar = Progress(total, "Getting art")
 
     def report(n, status, stem, game=None):
         counts[status] += 1
-        print(f"[{n:>{width}}/{total}] {status:<8} {stem}" + (f"  ->  {game[1]} [{game[2]}]" if game else ""))
+        bar.log(f"[{n:>{width}}/{total}] {status:<8} {stem}" + (f"  ->  {game[1]} [{game[2]}]" if game else ""))
+        bar.update(step=1, extra=f"{counts['saved']} saved")
 
     def save(n, stem, game):
         result = fetch_best(game, kind, orient, rom_region(stem), cache, lock)
@@ -1548,6 +1958,7 @@ def folder_main(args, folder_text, cfg, videos=False):
                     report(n, "unsure", stem, found[0])
             else:
                 pool.submit(save, n, stem, found[0])
+    bar.close()
 
     were = "was" if len(unsure) == 1 else "were"
     if unsure and not args.yes:
@@ -1678,27 +2089,162 @@ def video_folder_main(args, folder, media):
         raise NotFound(f"No movies or shows in {folder}.")
     shows = sum(kind == "tv" for _, _, kind in entries)
     print(f"\nFound {len(entries) - shows} movies and {shows} shows in {folder}.\n")
+    library_main(args, folder, entries, find_poster, lambda d: d["i"]["imageUrl"], imdb_label, "poster")
+
+
+# ---------------------------------------------------------------- whole folders of music
+
+AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".wma", ".ape", ".wv", ".aiff", ".aif"}
+COVER_NAMES = ("cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png")
+
+
+def has_audio(folder):
+    try:
+        return any(f.suffix.lower() in AUDIO_EXTS for f in folder.iterdir() if f.is_file())
+    except OSError:
+        return False
+
+
+def looks_like_music(folder):
+    """Audio files in the folder, or in folders one or two levels down (Artist/Album)."""
+    try:
+        subdirs = [d for d in sorted(folder.iterdir()) if d.is_dir()][:30]
+        return has_audio(folder) or any(has_audio(d) or any(has_audio(s) for s in d.iterdir() if s.is_dir())
+                                        for d in subdirs)
+    except OSError:
+        return False
+
+
+def audio_tags(path):
+    """(artist, album) from an MP3's ID3v2 tag or a FLAC file's Vorbis comments, None where missing.
+    The album artist wins over the track artist, so a compilation stays one album."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1 << 18)
+    except OSError:
+        return None, None
+    tags = {}
+    if head[:3] == b"ID3" and len(head) > 10 and head[3] in (3, 4):
+        def syncsafe(b):
+            return b[0] << 21 | b[1] << 14 | b[2] << 7 | b[3]
+
+        v4 = head[3] == 4
+        end, pos = 10 + syncsafe(head[6:10]), 10
+        if head[5] & 0x40:  # an extended header comes first
+            pos += syncsafe(head[10:14]) if v4 else 4 + int.from_bytes(head[10:14], "big")
+        while pos + 10 <= min(end, len(head)) and head[pos] != 0:
+            frame = head[pos:pos + 4].decode("latin-1")
+            size = syncsafe(head[pos + 4:pos + 8]) if v4 else int.from_bytes(head[pos + 4:pos + 8], "big")
+            body = head[pos + 10:pos + 10 + size]
+            pos += 10 + size
+            if frame in ("TPE1", "TPE2", "TALB") and body:
+                encoding = {0: "latin-1", 1: "utf-16", 2: "utf-16-be", 3: "utf-8"}.get(body[0], "latin-1")
+                tags[frame] = body[1:].decode(encoding, "replace").split("\x00")[0].strip()
+        return tags.get("TPE2") or tags.get("TPE1") or None, tags.get("TALB") or None
+    if head[:4] == b"fLaC":
+        pos = 4
+        while pos + 4 <= len(head):
+            last, kind, size = head[pos] & 0x80, head[pos] & 0x7F, int.from_bytes(head[pos + 1:pos + 4], "big")
+            body = head[pos + 4:pos + 4 + size]
+            if kind == 4:  # VORBIS_COMMENT: a vendor string, then KEY=value strings, lengths little-endian
+                p = 4 + int.from_bytes(body[:4], "little")
+                count, p = int.from_bytes(body[p:p + 4], "little"), p + 4
+                for _ in range(count):
+                    n = int.from_bytes(body[p:p + 4], "little")
+                    key, _, value = body[p + 4:p + 4 + n].decode("utf-8", "replace").partition("=")
+                    tags.setdefault(key.upper(), value.strip())
+                    p += 4 + n
+                return tags.get("ALBUMARTIST") or tags.get("ARTIST") or None, tags.get("ALBUM") or None
+            if last:
+                break
+            pos += 4 + size
+    return None, None
+
+
+def scan_music(folder):
+    """The albums in a music folder: [(name to show, cover path, (artist, album))]. An album is a folder
+    with audio files in it. Its artist and album come from the files' tags, else from the folder names
+    (Artist/Album, or "Artist - Album (2003)")."""
+    albums = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".")) if len(Path(root).relative_to(folder).parts) < 3 else []
+        here = Path(root)
+        songs = sorted(here / f for f in files if Path(f).suffix.lower() in AUDIO_EXTS)
+        if not songs:
+            continue
+        artist, album = next(((a, b) for a, b in map(audio_tags, songs[:3]) if b), (None, None))
+        if not album:
+            name = re.sub(r"\s*[\[(][^\])]*[\])]", "", here.name).strip()  # "(2003)", "[FLAC]"
+            if " - " in name:
+                artist, album = (part.strip() for part in name.split(" - ", 1))
+            else:
+                artist, album = (here.parent.name if here != folder else None), name
+        cover = next((here / n for n in COVER_NAMES if (here / n).exists()), here / "cover.jpg")
+        albums.append((f"{artist} - {album}" if artist else album, cover, (artist, album)))
+    return albums
+
+
+def plain_album(title):
+    """An album title without "(Remastered 2009)" or "[Deluxe Edition]"."""
+    return re.sub(r"\s*[(\[][^)\]]*[)\]]", "", title).strip() or title
+
+
+def find_album(name, hint):
+    """Deezer albums for (artist, album): (candidates best first, sure)."""
+    artist, album = hint
+    plain = plain_album(album)
+    try:
+        results = get_json("https://api.deezer.com/search/album", {"q": f"{artist or ''} {plain}".strip(),
+                                                                   "limit": 10}).get("data", [])
+    except (urllib.error.URLError, ValueError):
+        return [], False
+    same = [r for r in results if norm(plain_album(r["title"])) == norm(plain)
+            and (not artist or norm(r["artist"]["name"]) == norm(artist))]
+    return same + [r for r in results if r not in same], bool(same)
+
+
+def album_cover_url(r):
+    """Apple Music's 3000px copy when it has the album, else Deezer's."""
+    return (itunes_album_art(r["artist"]["name"], plain_album(r["title"]))
+            or r["cover_xl"].replace("1000x1000", "1800x1800"))
+
+
+def music_folder_main(args, folder):
+    """A cover.jpg in every album folder, where music players and servers look for it."""
+    albums = scan_music(folder)
+    if not albums:
+        raise NotFound(f"No music in {folder}.")
+    print(f"\nFound {len(albums)} album{'s' * (len(albums) != 1)} in {folder}.\n")
+    library_main(args, folder, albums, find_album, album_cover_url,
+                 lambda r: f"{r['artist']['name']} - {r['title']}", "cover")
+
+
+def library_main(args, folder, entries, find, image_url, label, noun):
+    """Shared by the movie and music folder modes: look every entry up, save the sure matches, then ask
+    about the rest. entries: [(name, picture path, hint)]; find(name, hint) -> (candidates, sure);
+    image_url(candidate) and label(candidate) describe a candidate; noun is "poster" or "cover"."""
     total, width = len(entries), len(str(len(entries)))
     counts = {"saved": 0, "had it": 0, "unsure": 0, "no match": 0, "failed": 0}
-    unsure = []
+    unsure, bar = [], Progress(total, "Looking up")
 
     def report(n, status, name, match=None):
         counts[status] += 1
-        print(f"[{n:>{width}}/{total}] {status:<8} {name}" + (f"  ->  {imdb_label(match)}" if match else ""))
+        bar.log(f"[{n:>{width}}/{total}] {status:<8} {name}" + (f"  ->  {label(match)}" if match else ""))
+        bar.update(step=1, extra=f"{counts['saved']} saved")
 
     def save(dest, match):
         try:
-            data = http_get(match["i"]["imageUrl"], timeout=90)
+            data = http_get(image_url(match), timeout=90)
         except (urllib.error.URLError, OSError):
             return False
         dest.with_suffix(image_ext(data)).write_bytes(data)
         return True
 
-    def handle(entry):  # -> (status, matches)
-        name, dest, kind = entry
+    def handle(entry):  # -> (status, candidates)
+        name, dest, hint = entry
         if any(dest.with_suffix(ext).exists() for ext in (".jpg", ".png", ".webp")):
             return "had it", []
-        found, sure = find_poster(name, kind)
+        found, sure = find(name, hint)
         if not found:
             return "no match", []
         if not sure:
@@ -1709,26 +2255,26 @@ def video_folder_main(args, folder, media):
         for n, ((name, dest, _), (status, found)) in enumerate(zip(entries, pool.map(handle, entries)), 1):
             report(n, status, name, found[0] if found else None)
             if status == "unsure":
-                unsure.append((n, name, dest, found))
+                unsure.append((name, dest, found))
+    bar.close()
 
     were = "was" if len(unsure) == 1 else "were"
     if unsure and not args.yes:
         print(f"\n{len(unsure)} {were}n't a sure match. Pick the right one for each:")
-        for i, (_, name, dest, found) in enumerate(unsure, 1):
+        for i, (name, dest, found) in enumerate(unsure, 1):
             pick = choose(f'({i}/{len(unsure)}) Which one is "{name}"?',
-                          [imdb_label(d) for d in found] + ["Skip this one", "Skip the rest"])
+                          [label(d) for d in found] + ["Skip this one", "Skip the rest"])
             if pick == len(found) + 1:
                 break
             if pick < len(found):
                 counts["unsure"] -= 1
                 ok = save(dest, found[pick])
                 counts["saved" if ok else "failed"] += 1
-                print(f"  saved {dest.relative_to(folder)}" if ok
-                      else f"  couldn't download the poster for {found[pick]['l']}")
+                print(f"  saved {dest.relative_to(folder)}" if ok else f"  couldn't download that {noun}")
     elif unsure:
         print(f"\n{len(unsure)} {were}n't a sure match, so {'it was' if len(unsure) == 1 else 'they were'} "
               "skipped. Run without -y to pick by hand.")
-    print(f"\nDone: {counts['saved']} saved, {counts['had it']} already had a poster, {counts['unsure']} skipped, "
+    print(f"\nDone: {counts['saved']} saved, {counts['had it']} already had a {noun}, {counts['unsure']} skipped, "
           f"{counts['no match']} not found, {counts['failed']} failed.")
 
 
@@ -1935,6 +2481,320 @@ def steam_main(args, steam_text):
     print("\nDone. Restart Steam to see the new art.")
 
 
+# ---------------------------------------------------------------- box walls
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+
+def pictures_in(folder):
+    try:
+        return sorted(f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS
+                      and not f.stem.startswith("box wall"))
+    except OSError:
+        return []
+
+
+def make_collage(paths, width=3840, gap=12, background="#111114"):
+    """Every picture in a grid on one image, about 16:9 overall. Cells take the usual picture shape and each
+    picture is fitted inside its cell; a short last row is centred."""
+    Image, _ = pil()
+    sizes = []
+    for path in paths:
+        try:
+            with Image.open(path) as im:
+                sizes.append((path, im.size))
+        except OSError:
+            continue
+    if not sizes:
+        return None
+    shapes = sorted(w / h for _, (w, h) in sizes)
+    shape = shapes[len(shapes) // 2]  # the median, so one odd banner doesn't squash every cell
+    n = len(sizes)
+    cols = max(1, min(n, round(math.sqrt(n * (16 / 9) / shape))))
+    rows = math.ceil(n / cols)
+    cell_w = (width - gap * (cols + 1)) / cols
+    cell_h = cell_w / shape
+    canvas = Image.new("RGB", (width, round(rows * cell_h + gap * (rows + 1))), background)
+    for i, (path, (w, h)) in enumerate(sizes):
+        row, col = divmod(i, cols)
+        in_row = cols if row < rows - 1 else n - cols * (rows - 1)
+        offset = (cols - in_row) * (cell_w + gap) / 2
+        fit = min(cell_w / w, cell_h / h)
+        with Image.open(path) as im:
+            pic = im.convert("RGBA").resize((max(1, round(w * fit)), max(1, round(h * fit))), Image.LANCZOS)
+        x = offset + gap + col * (cell_w + gap) + (cell_w - pic.width) / 2
+        y = gap + row * (cell_h + gap) + (cell_h - pic.height) / 2
+        canvas.paste(pic, (round(x), round(y)), pic)
+    return canvas
+
+
+def collage_main(args, folder_text, cfg):
+    """A box wall: one poster of every picture in a folder. A ROM folder without art gets its box art first."""
+    folder = Path(os.path.expandvars(os.path.expanduser(folder_text.strip().strip('"').strip("'"))))
+    if not folder.is_dir():
+        raise NotFound(f"There's no folder at {folder}.")
+    pictures = pictures_in(folder) or pictures_in(folder / "covers")
+    if not pictures and scan_folder(folder):
+        print("No covers here yet, so first getting the box art for every game.")
+        args.type = args.type if args.type in FOLDER_SUBDIRS else "box"
+        art_folder = Path(args.out) if args.out else folder / FOLDER_SUBDIRS[args.type]
+        args.out = str(art_folder)
+        folder_main(args, str(folder), cfg)
+        pictures = pictures_in(art_folder)
+    if not pictures:
+        raise NotFound(f"No pictures in {folder}.")
+    print(f"\nMaking a box wall of {len(pictures)} pictures...")
+    wall = make_collage(pictures)
+    if not wall:
+        raise NotFound(f"None of the pictures in {folder} could be opened.")
+    dest = unique_path(folder / "box wall.jpg")
+    wall.save(dest, quality=92)
+    print(f"Saved {dest}  ({wall.width}x{wall.height})")
+    if args.wallpaper:
+        print("It's your desktop wallpaper now. To put your old one back: fetchart --undo-wallpaper"
+              if set_wallpaper(dest, cfg) else "Couldn't set the wallpaper on this system.")
+
+
+# ---------------------------------------------------------------- daily wallpaper
+
+DAILY_NAME = "fetchart daily wallpaper"
+
+
+def daily_command():
+    """How the scheduler starts fetchart: [program, script...]. pythonw keeps a console window from popping up."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    exe = Path(sys.executable)
+    windowless = exe.with_name("pythonw.exe")
+    return [str(windowless if windowless.exists() else exe), str(Path(__file__).resolve())]
+
+
+def schedule_daily(enable=True):
+    """Run "fetchart --daily-run" every morning (and as soon as possible after a morning the computer was off),
+    or remove that schedule. Returns False if this system's scheduler couldn't be used."""
+    cmd = daily_command() + ["--daily-run"]
+    if os.name == "nt":
+        if not enable:
+            return run_quiet(["schtasks", "/Delete", "/TN", DAILY_NAME, "/F"]) is not None
+        program, arguments = cmd[0], subprocess.list2cmdline(cmd[1:])
+        xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Sets a new game wallpaper every day. Turn it off with: fetchart --daily off</Description></RegistrationInfo>
+  <Triggers><CalendarTrigger><StartBoundary>2026-01-01T07:00:00</StartBoundary><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <StartWhenAvailable>true</StartWhenAvailable><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{html.escape(program)}</Command><Arguments>{html.escape(arguments)}</Arguments></Exec></Actions>
+</Task>
+"""
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        task = DATA_DIR / "daily-task.xml"
+        task.write_text(xml, encoding="utf-16")
+        return run_quiet(["schtasks", "/Create", "/TN", DAILY_NAME, "/XML", str(task), "/F"]) is not None
+    if sys.platform == "darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / "com.github.samuelarther.fetchart.daily.plist"
+        run_quiet(["launchctl", "unload", str(plist)])
+        if not enable:
+            plist.unlink(missing_ok=True)
+            return True
+        program = "".join(f"<string>{html.escape(part)}</string>" for part in cmd)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.github.samuelarther.fetchart.daily</string>
+  <key>ProgramArguments</key><array>{program}</array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>7</integer></dict>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+""", encoding="utf-8")
+        return run_quiet(["launchctl", "load", str(plist)]) is not None
+    # Linux: a systemd user timer, which runs inside the desktop session so gsettings can reach it.
+    units = Path.home() / ".config" / "systemd" / "user"
+    if not enable:
+        run_quiet(["systemctl", "--user", "disable", "--now", "fetchart-daily.timer"])
+        for name in ("fetchart-daily.service", "fetchart-daily.timer"):
+            (units / name).unlink(missing_ok=True)
+        return True
+    units.mkdir(parents=True, exist_ok=True)
+    (units / "fetchart-daily.service").write_text(
+        f"[Unit]\nDescription={DAILY_NAME}\n\n[Service]\nType=oneshot\nExecStart={subprocess.list2cmdline(cmd)}\n")
+    (units / "fetchart-daily.timer").write_text(
+        f"[Unit]\nDescription={DAILY_NAME}\n\n[Timer]\nOnCalendar=*-*-* 07:00\nPersistent=true\n\n"
+        "[Install]\nWantedBy=timers.target\n")
+    return (run_quiet(["systemctl", "--user", "daemon-reload"]) is not None
+            and run_quiet(["systemctl", "--user", "enable", "--now", "fetchart-daily.timer"]) is not None)
+
+
+def daily_main(args, text, cfg):
+    """Set up (or turn off) a new game wallpaper every day."""
+    text = text.strip()
+    if text.lower() in ("off", "stop", "no", "none"):
+        schedule_daily(enable=False)
+        had = cfg.pop("daily", None)
+        save_config(cfg)
+        print("The daily wallpaper is off." + (" Your old wallpaper: fetchart --undo-wallpaper" if had else ""))
+        return
+    db = open_index(args.update)
+    platform = match_platform(db, text, 0.8) if text and "," not in text else None
+    if platform:
+        pool, what = {"platform": platform}, f"popular {platform} games"
+    elif text:
+        games = []
+        for name in (t.strip() for t in text.split(",") if t.strip()):
+            found = search_games(db, name, None, "wallpaper")
+            if found:
+                games.append(list(found[0][:3]))
+                print(f"  {name}  ->  {found[0][1]} [{found[0][2]}]")
+            else:
+                print(f"  {name}: no key art found, so it's left out")
+        if not games:
+            raise NotFound("None of those games have key art for a wallpaper.")
+        pool, what = {"games": games}, f"{len(games)} game{'s' * (len(games) != 1)}"
+    else:
+        pool, what = {"popular": True}, "popular games"
+    cfg["daily"] = pool
+    save_config(cfg)
+    scheduled = schedule_daily()
+    daily_run(cfg, force=True)
+    if scheduled:
+        print(f"\nYou'll get a new wallpaper from {what} every morning (or when the computer first starts that day).")
+    else:
+        print("\nCouldn't set up the daily schedule on this system, so this is a one-off.")
+    print("Turn it off: fetchart --daily off. Your old wallpaper back: fetchart --undo-wallpaper")
+
+
+def daily_run(cfg, force=False):
+    """Today's wallpaper. Started by the scheduler, which may run it more than once a day."""
+    pool = cfg.get("daily")
+    today = time.strftime("%Y-%m-%d")
+    if not pool or (pool.get("last") == today and not force):
+        return
+    try:
+        db = open_index()
+        has_fanart = "EXISTS (SELECT 1 FROM images i WHERE i.id = g.id AND i.type = 'Fanart - Background')"
+        if "games" in pool:
+            games = [tuple(g) for g in pool["games"]]
+        else:
+            where = "g.platform = ? AND " if "platform" in pool else ""
+            games = db.execute(f"SELECT g.id, g.name, g.platform FROM games g WHERE {where}{has_fanart} "
+                               "ORDER BY g.votes DESC LIMIT 300", [pool["platform"]] if where else []).fetchall()
+        import random
+        choices = [g for g in games if g[1] != pool.get("game")] or games
+        gid, title, plat = random.choice(choices)
+        fanart = [url for _, url in images_by_type(db, gid).get("Fanart - Background", [])]
+        data = http_get(random.choice(fanart), timeout=90)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        dest = DATA_DIR / f"daily wallpaper {today}{image_ext(data)}"
+        dest.write_bytes(data)
+        if set_wallpaper(dest, cfg):
+            for old in DATA_DIR.glob("daily wallpaper *"):
+                if old.name != dest.name:
+                    old.unlink(missing_ok=True)
+        pool.update(last=today, game=title)
+        save_config(cfg)
+        print(f"Today's wallpaper: {title} [{plat}]")
+    except Exception as e:  # noqa: BLE001 - the scheduler has no console to show this, so keep a log
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(DATA_DIR / "daily.log", "a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M')} {type(e).__name__}: {e}\n")
+        print(f"Couldn't change the wallpaper: {e}")
+
+
+# ---------------------------------------------------------------- lists of names
+
+def list_main(args, path_text, cfg):
+    """Art for every name in a text file. A line is a name, optionally with ", platform" (or ", movie",
+    ", album", ", pokemon"...) after it; # starts a comment. Takes the top match and best picture for each."""
+    path = Path(os.path.expandvars(os.path.expanduser(path_text.strip().strip('"').strip("'"))))
+    try:
+        lines = [line.split("#")[0].strip() for line in path.read_text(encoding="utf-8-sig").splitlines()]
+    except OSError:
+        raise NotFound(f"Couldn't read {path}.")
+    lines = [line for line in lines if line]
+    if not lines:
+        raise NotFound(f"{path} has no names in it.")
+    if not args.type and not args.yes:
+        kinds = [k for k in ART_TYPES if k not in ("ach", "wallpaper")]
+        args.type = kinds[choose("What art do you want for the games?", [ART_TYPES[k] for k in kinds])]
+    args.out = str(pick_folder(args.out, cfg, args.yes))
+    args.yes, done, failed = True, 0, []
+    for n, line in enumerate(lines, 1):
+        name, comma, word = line.rpartition(",")
+        name, word = (name.strip(), word.strip()) if comma else (line, None)
+        print(f"\n[{n}/{len(lines)}] {line}")
+        one = argparse.Namespace(**vars(args))
+        one.game, one.platform = name, word
+        try:
+            run_category(one, name, cfg, media_word(word) or "game")
+            done += 1
+        except (NotFound, SystemExit) as e:
+            failed.append(line)
+            print(f"  skipped: {e}" if str(e) not in ("", "None", "1") else "  skipped")
+    print(f"\nDone: {done} of {len(lines)} found." + (f" Not found: {'; '.join(failed)}" if failed else "")
+          + f"\nThe art is in {args.out}")
+
+
+# ---------------------------------------------------------------- tab completion
+
+def completion_script(parser, shell):
+    """A script that teaches the shell to Tab-complete fetchart's options, art types, shapes and platforms."""
+    options = sorted(s for a in parser._actions for s in a.option_strings if a.help != argparse.SUPPRESS)
+    words = sorted(set(PLATFORMS) | {k for k in MEDIA if k.isascii()})
+    values = {"-t --type": list(ART_TYPES), "-r --orient": list(ORIENTS), "-q --quality": ["low", "medium", "high", "all"],
+              "--completion": ["powershell", "bash", "zsh"]}
+    paths = "-o --out -f --folder --collage --list --steam"
+    if shell == "powershell":
+        cases = "\n".join(f"        {{ $_ -in @({', '.join(repr(o) for o in opts.split())}) }} {{ @({', '.join(repr(v) for v in vals)}) }}"
+                          for opts, vals in values.items())
+        return f"""Register-ArgumentCompleter -Native -CommandName fetchart, fetchart.exe -ScriptBlock {{
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $words = @($commandAst.CommandElements | ForEach-Object {{ $_.ToString() }})
+    $prev = if ($wordToComplete) {{ $words[-2] }} else {{ $words[-1] }}
+    $takesValue = @({', '.join(repr(o) for o in (paths + ' ' + ' '.join(values)).split())})
+    $values = switch ($prev) {{
+{cases}
+        {{ $_ -in @({', '.join(repr(o) for o in paths.split())}) }} {{ return }}
+        default {{
+            if ($wordToComplete -like '-*') {{ @({', '.join(repr(o) for o in options)}) }}
+            else {{
+                $given = 0
+                for ($i = 1; $i -lt $words.Count; $i++) {{
+                    if ($words[$i] -eq $wordToComplete -and $i -eq $words.Count - 1) {{ break }}
+                    if ($words[$i] -notlike '-*' -and $takesValue -notcontains $words[$i - 1]) {{ $given++ }}
+                }}
+                if ($given -ge 1) {{ @({', '.join(repr(w) for w in words)}) }}
+            }}
+        }}
+    }}
+    $values | Where-Object {{ $_ -like "$wordToComplete*" }} |
+        ForEach-Object {{ [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }}
+}}
+"""
+    cases = "\n".join(f'        {"|".join(opts.split())}) COMPREPLY=($(compgen -W "{" ".join(vals)}" -- "$cur")); return;;'
+                      for opts, vals in values.items())
+    script = f"""_fetchart() {{
+    local cur="${{COMP_WORDS[COMP_CWORD]}}" prev="${{COMP_WORDS[COMP_CWORD-1]}}" i given=0
+    COMPREPLY=()
+    case "$prev" in
+{cases}
+        {"|".join(paths.split())}) COMPREPLY=(); return;;
+    esac
+    if [[ "$cur" == -* ]]; then COMPREPLY=($(compgen -W "{" ".join(options)}" -- "$cur")); return; fi
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        case " {paths} {" ".join(values)} " in *" ${{COMP_WORDS[i-1]}} "*) continue;; esac
+        [[ "${{COMP_WORDS[i]}}" != -* ]] && given=$((given + 1))
+    done
+    ((given >= 1)) && COMPREPLY=($(compgen -W "{" ".join(words)}" -- "$cur"))
+}}
+complete -o default -F _fetchart fetchart
+"""
+    return ("autoload -U +X bashcompinit && bashcompinit\n" + script) if shell == "zsh" else script
+
+
 # ---------------------------------------------------------------- main
 
 def pick_art(options, wanted, auto, heading):
@@ -1957,7 +2817,7 @@ def pick_art(options, wanted, auto, heading):
     if len(options) == 1:
         print(f"\nOnly one option: {options[0].label()}")
         return options
-    cards = [(o.label(), o.preview or o.url, o) for o in options]
+    cards = [(o.label(), o.preview or o.url or data_uri(o.data), o) for o in options]
     i = choose("Which one? (biggest first)", [o.label() for o in options], auto=auto, allow_all=True,
                preview=lambda: open_preview(heading, cards))
     return options if i == -1 else [options[i]]
@@ -1984,7 +2844,7 @@ PREVIEW_PAGE = """<!doctype html>
   .pic { position: relative; display: flex; align-items: center; justify-content: center; min-height: 140px;
          padding: 12px; background: repeating-conic-gradient(var(--line) 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
   .pic > img:first-child { max-width: 100%; max-height: 420px; object-fit: contain; }
-  .pic.crop > img:first-child { aspect-ratio: 2 / 3; height: 420px; object-fit: cover; }
+  .pic.crop > img:first-child { width: 100%; height: auto; object-fit: cover; }
   .pic.small > img:first-child { width: 128px; height: 128px; image-rendering: pixelated; }
   .logo { position: absolute; left: 50%; bottom: 10%; transform: translateX(-50%); width: 45%; max-height: 30%;
           object-fit: contain; filter: drop-shadow(2px 3px 4px rgba(0, 0, 0, .6)); }
@@ -2014,7 +2874,9 @@ def open_preview(heading, cards, small=False):
     for n, (label, src, art) in enumerate(cards, 1):
         classes = "pic" + (" crop" if art and art.crop else "") + (" small" if small else "")
         logo = f'<img class="logo" src="{html.escape(art.logo)}" alt="">' if art and art.logo else ""
-        tiles.append(f'<figure><div class="{classes}"><img src="{html.escape(src)}" alt="">{logo}'
+        ratio = (2 / 3 if art.crop is True else art.crop) if art and art.crop else None
+        style = f' style="aspect-ratio: {ratio:.4f}"' if ratio else ""
+        tiles.append(f'<figure><div class="{classes}"><img src="{html.escape(src)}"{style} alt="">{logo}'
                      f'<span class="num">{n}</span></div><figcaption>{html.escape(label)}</figcaption></figure>')
     page = (PREVIEW_PAGE.replace("MIN", "200" if small else "280").replace("TITLE", html.escape(heading))
             .replace("TILES", "\n".join(tiles)))
@@ -2051,7 +2913,8 @@ def main():
                    help="pc, xbox, x360, ps2, n64, gc, wii, switch, gba, ... (default: all), or movie, tv, album, painting")
     p.add_argument("-t", "--type", choices=list(ART_TYPES),
                    help="box, clean (no logo), logo, clearlogo, icon, ach (achievements / trophies), or wallpaper")
-    p.add_argument("-r", "--orient", choices=["portrait", "landscape"], help="key art orientation")
+    p.add_argument("-r", "--orient", choices=list(ORIENTS),
+                   help="key art shape: landscape, portrait, phone, ultrawide (21:9) or superwide (32:9)")
     p.add_argument("-q", "--quality", help="low, medium, high, all, or an exact size like 1920x1080")
     p.add_argument("-o", "--out", help="folder to save into")
     p.add_argument("-y", "--yes", action="store_true", help="take the top match and defaults, no prompts")
@@ -2059,53 +2922,96 @@ def main():
     p.add_argument("--undo-wallpaper", action="store_true",
                    help="put back the wallpaper you had before fetchart changed it")
     p.add_argument("-f", "--folder", help="get art for every game in this folder, named after each ROM file "
-                                          "(or posters for a folder of movies and shows)")
+                                          "(or posters for movies and shows, covers for albums)")
     p.add_argument("--steam", nargs="?", const="", metavar="STEAM_DIR",
                    help="add library art to the non-Steam games in Steam")
+    p.add_argument("--collage", metavar="FOLDER", help="make one big poster (a box wall) of every cover in a folder")
+    p.add_argument("--list", metavar="FILE", help="get art for every name in a text file, one per line "
+                                                  '(add ", platform" or ", movie" etc. after a name)')
+    p.add_argument("--daily", nargs="?", const="", metavar="GAMES",
+                   help='a new game wallpaper every day: game names ("halo 3, celeste"), a platform, '
+                        "nothing for popular games, or off")
+    p.add_argument("--daily-run", action="store_true", help=argparse.SUPPRESS)  # what the scheduler starts
+    p.add_argument("--completion", choices=["powershell", "bash", "zsh"],
+                   help="print the tab-completion script for your shell")
     p.add_argument("--update", action="store_true", help="re-download the game database")
     p.add_argument("--version", action="version", version=f"fetchart {__version__}")
     args = p.parse_args()
+    if args.completion:
+        return print(completion_script(p, args.completion))
+    if args.daily_run:
+        return daily_run(load_config())
     if args.undo_wallpaper:
         return undo_wallpaper(load_config())
-    if args.steam is not None:
-        return steam_main(args, args.steam)
-    if args.folder:
-        args.platform = args.platform or args.game  # fetchart --folder D:\ROMs n64
-        try:
-            return folder_main(args, args.folder, load_config())
-        except NotFound as e:
-            sys.exit(str(e))
-    if args.update and not args.game:
+    if args.update and not (args.game or args.folder or args.list or args.collage or args.steam is not None):
         open_index(force_update=True)
         return
+    # Options that name their own target, then a name on the command line, else the menus.
+    for category, value in (("steam", args.steam), ("folder", args.folder), ("collage", args.collage),
+                            ("list", args.list), ("daily", args.daily)):
+        if value is not None:
+            if category == "folder":
+                args.platform = args.platform or args.game  # fetchart --folder D:\ROMs n64
+            try:
+                return run_category(args, value, load_config(), category)
+            except NotFound as e:
+                sys.exit(str(e))
 
     # With no name given (typed alone, or double-clicked), everything is asked through menus.
     interactive = not args.game
     if interactive:
         category = list(CATEGORIES)[choose("What are you looking for?", [c[0] for c in CATEGORIES.values()])]
     else:
-        category = MEDIA.get(re.sub(r"[^a-z]", "", (args.platform or "").lower()), "game")
+        category = media_word(args.platform) or "game"
     cfg = load_config()
-    if category == "steam":
-        return steam_main(args, "")
     while True:
-        if interactive:
+        if interactive and CATEGORIES[category][1]:
             args.game = ask("\n" + CATEGORIES[category][1])
-            if not args.game:
+            if not args.game and category != "daily":
                 return
-        query = re.sub(r"[-_]+", " ", args.game).strip()
         try:
-            if category in ("folder", "videos"):
-                return folder_main(args, args.game, cfg, videos=category == "videos")
-            if category == "game":
-                return game_main(args, query, cfg)
-            if category == "painting":
-                return painting_main(args, query, cfg)
-            return media_main(args, query, cfg, category)
+            return run_category(args, args.game or "", cfg, category)
         except NotFound as e:
             if not interactive:
                 sys.exit(str(e))
             print(f"{e} Try another name (Enter to quit).")
+
+
+def media_word(text):
+    """The category a platform word stands for ("movie", "Pokémon", "manga"), or None."""
+    return MEDIA.get(re.sub(r"[^a-z]", "", norm(text or "")))
+
+
+def run_category(args, text, cfg, category):
+    """Do one search or job. text is the name typed (or the folder / file / list of games)."""
+    query = re.sub(r"[-_]+", " ", text).strip()
+    if category in ("folder", "videos", "musicfolder"):
+        return folder_main(args, text, cfg, mode=category)
+    handlers = {
+        "steam": lambda: steam_main(args, text),
+        "collage": lambda: collage_main(args, text, cfg),
+        "list": lambda: list_main(args, text, cfg),
+        "daily": lambda: daily_main(args, text, cfg),
+        "game": lambda: game_main(args, query, cfg),
+        "painting": lambda: painting_main(args, query, cfg),
+        "pokemon": lambda: pokemon_main(args, query, cfg),
+        "minecraft": lambda: minecraft_main(args, text, cfg),
+        # The menu's "Anime or manga" searches both; the word "anime" on the command line means anime.
+        "anime": lambda: anime_main(args, query, cfg, "ANIME" if media_word(args.platform) == "anime" else None),
+        "manga": lambda: anime_main(args, query, cfg, "MANGA"),
+        "book": lambda: book_main(args, query, cfg),
+        "app": lambda: app_main(args, query, cfg),
+    }
+    return handlers.get(category, lambda: media_main(args, query, cfg, category))()
+
+
+def pick_orient(args, wallpaper=False):
+    """The shape for key art: from -r, else asked (landscape with -y)."""
+    keys = ["landscape", "ultrawide", "superwide", "phone"] if wallpaper else list(ORIENTS)
+    if args.orient in keys:
+        return args.orient
+    title = "Which screen is it for?" if wallpaper else "Which shape?"
+    return keys[choose(title, [ORIENTS[k][0] for k in keys], auto=args.yes)]
 
 
 def game_main(args, query, cfg):
@@ -2119,6 +3025,8 @@ def game_main(args, query, cfg):
     found = search_games(db, query, platform, args.type)
     if args.type == "ach":
         found = [g for g in found if g[2] in ACH_SOURCES]
+    if args.yes and found and found[0][5] < 0.5:  # nobody's there to say a far-off guess is wrong
+        found = []
     groups = group_games(found, split_year(query)[1])
     if not groups:
         what = ART_TYPES[args.type].lower() if args.type else "game"
@@ -2136,10 +3044,11 @@ def game_main(args, query, cfg):
         orient = args.orient
         args.wallpaper = wallpaper_flag or kind == "wallpaper"
         if args.wallpaper:
-            kind, orient = ("clean" if kind == "wallpaper" else kind), "landscape"
-        if kind in ("clean", "logo") and not orient:
-            orient = ["landscape", "portrait"][choose("Portrait or landscape?", ["Landscape", "Portrait"],
-                                                      auto=args.yes)]
+            kind = "clean" if kind == "wallpaper" else kind
+            orient = pick_orient(args, wallpaper=True)
+            args.wallpaper = orient != "phone"  # a phone wallpaper is only saved, for copying to the phone
+        elif kind in ("clean", "logo"):
+            orient = pick_orient(args)
         if kind == "ach":
             return download_achievements(title, plat, args, cfg)
         print(f"Finding art for {title} [{plat}]...")
@@ -2150,7 +3059,8 @@ def game_main(args, query, cfg):
         if args.type or args.yes:
             sys.exit(missing)
         print(f"{missing} Pick another kind.")
-    tag = {"box": "box art", "clean": "key art", "logo": "key art (logo)", "clearlogo": "logo", "icon": "icon"}[kind]
+    tag = {"box": "box art", "back": "back cover", "box3d": "3D box", "disc": "disc", "screenshot": "screenshot",
+           "flyer": "ad flyer", "clean": "key art", "logo": "key art (logo)", "clearlogo": "logo", "icon": "icon"}[kind]
     # Store lookups guess URLs, so for icons drop the ones that didn't resolve to a real image.
     finish(options, f"{title} [{plat}] - {tag}", args, cfg, require_size=kind == "icon")
 
@@ -2178,7 +3088,7 @@ def finish(options, name_prefix, args, cfg, require_size=False):
         size = art.final_size()
         name = name_prefix + (f" {size[0]}x{size[1]}" if size else "") + f" - {art.source}"
         try:
-            data, ext = render(art)
+            data, ext = render(art, progress=True)
         except (urllib.error.URLError, OSError) as e:
             print(f"  failed {art.label()}: {e}")
             continue
@@ -2315,8 +3225,11 @@ def undo_wallpaper(cfg):
         sys.exit("Couldn't change the wallpaper back on this system.")
     cfg.pop("wallpaper_before")
     cfg.pop("wallpaper_ours", None)
+    daily = cfg.pop("daily", None)
+    if daily:  # otherwise tomorrow's run would change it again
+        schedule_daily(enable=False)
     save_config(cfg)
-    print("Your old wallpaper is back.")
+    print("Your old wallpaper is back." + (" The daily wallpaper is off too." if daily else ""))
 
 
 def run():

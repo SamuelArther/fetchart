@@ -1,14 +1,16 @@
 # fetchart
 
-Find and download game art, movie and TV posters, album covers and paintings from the command line. No API keys or accounts are needed.
+Find and download game art, movie and TV posters, album covers, paintings, Pokémon, Minecraft skins, anime, book covers and app icons from the command line. No API keys or accounts are needed.
 
-For games, it covers about 190,000 titles on every platform: box covers, key art (with or without the logo), see-through logos, console dashboard tiles, and achievement and trophy icons for Xbox, PlayStation, Steam and retro consoles. It can also fill in Steam's library art for your non-Steam games, put posters in your movie folders, and set any of it as your wallpaper.
+For games, it covers about 190,000 titles on every platform: front and back covers, 3D boxes, discs and cartridges, screenshots, old magazine ads, key art (with or without the logo), see-through logos, console dashboard tiles, and achievement and trophy icons for Xbox, PlayStation, Steam and retro consoles.
+
+It also works on whole libraries: art for every ROM in a folder, posters for a Plex or Jellyfin movie folder, covers for a music folder, Steam library art for your non-Steam games, and a "box wall" poster of a whole collection. And it can set any of it as your wallpaper, or give you a new one every day.
 
 ![fetchart finding the Xbox 360 box art for Modern Warfare 2](docs/demo.gif)
 
-Just type `fetchart` in PowerShell, Command Prompt or any terminal, and pick what you're looking for: a video game, a movie or TV show, music, a painting, a whole folder of games or movies, or art for your non-Steam games.
+Just type `fetchart` in PowerShell, Command Prompt or any terminal, and pick what you're looking for from the menu.
 
-Type the name, then pick the right one from the matches. Each game appears once, and you pick the platform after it. Then pick the kind of art, choose from every image found (biggest first), and pick a folder. For key art, also pick portrait or landscape. fetchart remembers the last folder you used.
+Type the name, then pick the right one from the matches. Each game appears once, and you pick the platform after it. Then pick the kind of art, choose from every image found (biggest first), and pick a folder. For key art, also pick its shape: landscape, portrait, a phone wallpaper, or ultrawide (21:9 or 32:9). fetchart remembers the last folder you used.
 
 **Controls:** use the arrow keys or click with the mouse, and press Enter. Typing a number jumps to it. On the image and achievement lists, press **P** to see every option as a numbered picture in your browser. For achievements, Space (or a click) ticks as many as you want, and A ticks them all. Mouse clicks work in the Windows console; on macOS and Linux, use the keys.
 
@@ -28,7 +30,20 @@ fetchart --folder D:\ROMs\N64
 - Games that already have art are skipped, so running it again only fills the gaps.
 - If a name isn't a sure match, fetchart asks you to pick the right game at the end, or skips it with `-y`.
 
-The art goes in a `covers` folder inside the ROM folder (or `fanart`, `keyart`, `marquees` for logos, `icons` for the other kinds); `-o` picks another.
+The art goes in a folder inside the ROM folder, named the way ES-DE names them: `covers`, `backcovers`, `3dboxes`, `physicalmedia`, `screenshots`, `fanart`, `marquees` (logos), plus `keyart`, `icons` and `flyers`. `-o` picks another.
+
+### Box wall
+
+![A box wall of N64 games](docs/boxwall.jpg)
+
+One big 4K poster of a whole collection:
+
+```
+fetchart --collage D:\ROMs\N64
+fetchart --collage D:\ROMs\N64 -w
+```
+
+It uses the pictures in the folder, or its `covers` folder. A ROM folder with no art yet gets its box art first. Add `-w` to make it your wallpaper.
 
 ### A folder of movies or TV shows
 
@@ -44,6 +59,32 @@ fetchart --folder D:\Movies
 - Anything that already has a poster is skipped. Anything that isn't a sure match (like `Dune` with no year) is asked about at the end.
 
 In Plex, turn on **Use local assets** for the library so it picks the posters up.
+
+### A folder of music
+
+```
+fetchart --folder D:\Music
+```
+
+Every album folder gets a `cover.jpg`, which Plex, Jellyfin, Navidrome, Kodi, foobar2000 and MusicBee all pick up. The artist and album come from the files' tags (MP3 and FLAC), or else from the folder names (`Artist\Album` or `Artist - Album (2003)`). Covers come from Apple Music at up to 3000x3000, or Deezer. Albums that already have a cover are skipped.
+
+### A list of names
+
+Put one name per line in a text file. Add a comma and a platform, or `movie`, `album`, `pokemon` and so on, when it isn't a game:
+
+```
+halo 3, x360
+mw2 2009
+inception, movie
+the dark side of the moon, album
+mewtwo, pokemon
+```
+
+```
+fetchart --list wishlist.txt -t box -o D:\Art
+```
+
+fetchart takes the top match and the best picture for each line, and lists the ones it couldn't find at the end.
 
 ### Steam art for non-Steam games
 
@@ -66,9 +107,41 @@ fetchart halo-3 x360 -w
 fetchart "the starry night" painting -w
 ```
 
-For games it uses landscape key art without the logo (`-t logo` keeps the logo). For paintings it uses a 4K copy instead of the giant museum scan.
+For games it uses key art without the logo (`-t logo` keeps the logo) and asks which screen it's for: a normal one, an ultrawide (21:9), a super ultrawide or two monitors (32:9), or a phone, which is only saved. For paintings it uses a 4K copy instead of the giant museum scan.
 
-To go back to the wallpaper you had before, run `fetchart --undo-wallpaper`, even after several `-w` runs. fetchart keeps a copy of your old picture, so it works even if the original file is gone. A Windows slideshow or Spotlight comes back as the single picture that was showing.
+**A new wallpaper every day:**
+
+```
+fetchart --daily "halo 3, celeste, elden ring"
+fetchart --daily n64
+fetchart --daily
+fetchart --daily off
+```
+
+You can give it some games, a platform (its most popular games), or nothing (popular games from everywhere). It changes the wallpaper right away, then every morning, or the first time the computer is on that day. Windows uses Task Scheduler, macOS uses launchd, and Linux uses a systemd user timer.
+
+To go back to the wallpaper you had before, run `fetchart --undo-wallpaper`, even after several `-w` runs or daily changes (it turns the daily wallpaper off too). fetchart keeps a copy of your old picture, so it works even if the original file is gone. A Windows slideshow or Spotlight comes back as the single picture that was showing.
+
+### Pokémon, Minecraft skins, anime, books and apps
+
+Use the word in place of a platform, or pick it from the menu:
+
+```
+fetchart charizard pokemon
+fetchart Notch minecraft
+fetchart attack-on-titan anime
+fetchart berserk manga
+fetchart "the hobbit" book
+fetchart minecraft app
+```
+
+| Search | What you get | Where it comes from |
+|---|---|---|
+| Pokémon | Official artwork, Pokémon HOME renders, animated sprites, and every game's sprite from Red and Blue on (scaled up with sharp pixels), shiny ones too | [PokéAPI](https://pokeapi.co/) |
+| Minecraft | A 3D render of the player's head, their whole body, their face, the skin file itself, and their cape | Mojang |
+| Anime / manga | Cover and banner | [AniList](https://anilist.co/) |
+| Books | The cover, plus other editions' covers | [Open Library](https://openlibrary.org/) |
+| Apps | The 1024x1024 App Store icon and full-size screenshots | Apple App Store |
 
 ## Install
 
@@ -114,16 +187,32 @@ Short names work too: `mw2`, `bo2`, `botw`, `oot`, `gta5`, `ff7`, `csgo`, `ssbm`
 
 | Option | What it does |
 |---|---|
-| `-t box\|clean\|logo\|clearlogo\|icon\|ach\|wallpaper` | Skip the art-type menu |
-| `-r portrait\|landscape` | Orientation, for key art |
+| `-t TYPE` | Skip the art-type menu (types are listed below) |
+| `-r landscape\|portrait\|phone\|ultrawide\|superwide` | The shape, for key art |
 | `-q low\|medium\|high\|all\|1920x1080` | Skip the "which one" menu |
 | `-o FOLDER` | Where to save |
 | `-y` | No prompts: take the top match and the best image |
 | `-w` | Set the picture as your desktop wallpaper |
 | `--undo-wallpaper` | Put back the wallpaper you had before |
-| `-f FOLDER` | Get art for every game, movie or show in a folder (see above) |
+| `--daily [GAMES\|PLATFORM\|off]` | A new game wallpaper every day (see above) |
+| `-f FOLDER` | Get art for every game, movie, show or album in a folder (see above) |
+| `--collage FOLDER` | Make a box wall poster (see above) |
+| `--list FILE` | Get art for every name in a text file (see above) |
 | `--steam` | Fill in Steam's library art for your non-Steam games (see above) |
+| `--completion powershell\|bash\|zsh` | Print the Tab completion script (see below) |
 | `--update` | Re-download the game database |
+
+### Tab completion
+
+Press Tab to complete options, art types, shapes and platforms. Set it up once:
+
+| Shell | Run this once |
+|---|---|
+| PowerShell | `fetchart --completion powershell >> $PROFILE` |
+| bash | `echo 'eval "$(fetchart --completion bash)"' >> ~/.bashrc` |
+| zsh | `echo 'eval "$(fetchart --completion zsh)"' >> ~/.zshrc` |
+
+Then open a new terminal.
 
 ### Examples
 
@@ -134,6 +223,8 @@ fetchart zelda-ocarina-of-time n64 -t clean -r portrait
 fetchart gears-of-war -t ach
 fetchart uncharted-2 ps3 -t ach
 fetchart hollow-knight pc -t clearlogo
+fetchart super-mario-64 n64 -t flyer
+fetchart elden-ring pc -t logo -r phone
 ```
 
 ### Movies, TV, albums and paintings
@@ -168,7 +259,12 @@ Full names work too, e.g. `"Sega Dreamcast"`.
 | Type | What you get | Where it comes from |
 |---|---|---|
 | **box** | The front cover from every region, rating and all | LaunchBox Games Database |
-| **clean** | Key art without the logo. Landscape, or a portrait crop | LaunchBox fanart, Steam library art |
+| **back** | The back of the box | LaunchBox |
+| **box3d** | The whole box at an angle, see-through background | LaunchBox |
+| **disc** | The disc or cartridge | LaunchBox |
+| **screenshot** | Gameplay screenshots and the title screen | LaunchBox |
+| **flyer** | Old magazine and store ads | LaunchBox |
+| **clean** | Key art without the logo, in any shape (landscape, portrait, phone, 21:9, 32:9) | LaunchBox fanart, Steam library art |
 | **logo** | Key art with the logo | Steam capsules, LaunchBox banners and posters, or fanart with the game's logo laid on top |
 | **clearlogo** | Just the logo, as a PNG with a see-through background | Steam library logos, LaunchBox clear logos |
 | **icon** | The square tile on the console's menu | See below |
@@ -209,7 +305,7 @@ Xbox 360 title IDs are looked up through [XboxUnity](http://xboxunity.net/).
 
 ## Credits and disclaimer
 
-The art comes from the LaunchBox Games Database community, Steam, the Microsoft Store, Xbox Live, XboxUnity, Exophase, RetroAchievements, Nintendo, IMDb, Wikipedia, Wikimedia Commons, Deezer, Apple Music, and MusicBrainz / the Cover Art Archive. Thanks to all of them for keeping it online.
+The art comes from the LaunchBox Games Database community, Steam, the Microsoft Store, Xbox Live, XboxUnity, Exophase, RetroAchievements, Nintendo, IMDb, Wikipedia, Wikimedia Commons, Deezer, Apple Music, MusicBrainz / the Cover Art Archive, PokéAPI, Mojang, AniList, Open Library and the App Store. Thanks to all of them for keeping it online.
 
 All art belongs to its respective owners. fetchart is meant for personal use, such as emulator frontends, media servers, desktop wallpapers and collection catalogs. It is not affiliated with any of the sites it pulls from, or with any game, film or music company.
 

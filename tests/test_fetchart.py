@@ -65,6 +65,29 @@ def vdf(entries):
     return out + b"\x08\x08"
 
 
+def mp3(artist, album, v4=False):
+    """The start of an MP3: an ID3v2 tag with artist and album frames (UTF-16 artist, Latin-1 album)."""
+    def size(n):
+        return bytes([n >> 21 & 127, n >> 14 & 127, n >> 7 & 127, n & 127]) if v4 else n.to_bytes(4, "big")
+
+    def frame(fid, body):
+        return fid + size(len(body)) + b"\0\0" + body
+    frames = frame(b"TPE1", b"\x01" + artist.encode("utf-16")) + frame(b"TALB", b"\x00" + album.encode("latin-1"))
+    head = b"ID3" + bytes([4 if v4 else 3, 0, 0])
+    n = len(frames)
+    return head + bytes([n >> 21 & 127, n >> 14 & 127, n >> 7 & 127, n & 127]) + frames + b"\xff\xfb" + b"\0" * 64
+
+
+def flac(**comments):
+    """The start of a FLAC file: STREAMINFO, then a Vorbis comment block."""
+    body = struct.pack("<I", 4) + b"test" + struct.pack("<I", len(comments))
+    for key, value in comments.items():
+        entry = f"{key}={value}".encode()
+        body += struct.pack("<I", len(entry)) + entry
+    return (b"fLaC" + bytes([0]) + (34).to_bytes(3, "big") + b"\0" * 34
+            + bytes([0x84]) + len(body).to_bytes(3, "big") + body)
+
+
 class Names(unittest.TestCase):
     def test_norm(self):
         self.assertEqual(fa.norm("Pokémon: Red & Blue (USA)"), "pokemon red and blue")
@@ -176,6 +199,35 @@ class Folders(unittest.TestCase):
             self.assertEqual(fa.scan_videos(root / "Breaking Bad"),
                              [("Breaking Bad", root / "Breaking Bad" / "poster.jpg", "tv")])
 
+    def test_audio_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, data in [("a.mp3", mp3("Daft Punk", "Discovery")), ("b.mp3", mp3("Björk", "Homogenic", v4=True)),
+                               ("c.flac", flac(ARTIST="Track Guy", ALBUMARTIST="Pink Floyd", ALBUM="Animals")),
+                               ("d.mp3", b"\xff\xfb no tag")]:
+                (Path(tmp) / name).write_bytes(data)
+            tags = [fa.audio_tags(Path(tmp) / n) for n in ("a.mp3", "b.mp3", "c.flac", "d.mp3")]
+            self.assertEqual(tags, [("Daft Punk", "Discovery"), ("Björk", "Homogenic"), ("Pink Floyd", "Animals"),
+                                    (None, None)])
+
+    def test_scan_music(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            files = {"Daft Punk/Discovery/01.mp3": mp3("Daft Punk", "Discovery"),
+                     "Radiohead/OK Computer (1997) [FLAC]/01.flac": b"fLaC",
+                     "Pink Floyd - The Wall/01.mp3": b"no tags", "Has Cover/01.mp3": mp3("A", "B")}
+            for name, data in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_bytes(data)
+            (root / "Has Cover" / "folder.jpg").write_bytes(b"")
+            self.assertTrue(fa.looks_like_music(root))
+            found = {name: (dest.relative_to(root).as_posix(), hint) for name, dest, hint in fa.scan_music(root)}
+            self.assertEqual(found, {
+                "Daft Punk - Discovery": ("Daft Punk/Discovery/cover.jpg", ("Daft Punk", "Discovery")),
+                "Radiohead - OK Computer": ("Radiohead/OK Computer (1997) [FLAC]/cover.jpg", ("Radiohead", "OK Computer")),
+                "Pink Floyd - The Wall": ("Pink Floyd - The Wall/cover.jpg", ("Pink Floyd", "The Wall")),
+                "A - B": ("Has Cover/folder.jpg", ("A", "B")),
+            })
+
     def test_rom_folder_is_not_videos(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "Mario Kart 64 (USA).z64").write_bytes(b"")
@@ -255,6 +307,41 @@ class Wallpaper(unittest.TestCase):
         self.original.unlink()
         fa.undo_wallpaper(cfg)
         self.assertEqual(Path(self.desktop["path"]).read_bytes(), b"photo")
+
+
+class Daily(unittest.TestCase):
+    """daily_run with the database, downloads and wallpaper faked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = {n: getattr(fa, n) for n in ("open_index", "http_get", "set_wallpaper", "DATA_DIR", "CONFIG")}
+        db = fixture_db()
+        for gid in (6, 10):
+            db.execute("INSERT INTO images VALUES (?, 'Fanart - Background', NULL, ?)", (gid, f"fanart{gid}.jpg"))
+        fa.open_index = lambda *a: db
+        fa.http_get = lambda url, **kw: b"\xff\xd8" + url.encode()
+        self.set = []
+        fa.set_wallpaper = lambda path, cfg: self.set.append(Path(path).read_bytes()) or True
+        fa.DATA_DIR, fa.CONFIG = Path(self.tmp.name), Path(self.tmp.name) / "config.json"
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(fa, name, value)
+        self.tmp.cleanup()
+
+    def test_once_a_day_and_a_new_game_each_time(self):
+        cfg = {"daily": {"games": [[6, "Halo 3", X360], [10, "Grand Theft Auto V", PS4]]}}
+        fa.daily_run(cfg)
+        fa.daily_run(cfg)  # the scheduler may start it again the same day
+        self.assertEqual(len(self.set), 1)
+        first = cfg["daily"]["game"]
+        fa.daily_run(cfg, force=True)
+        self.assertNotEqual(cfg["daily"]["game"], first)
+
+    def test_popular_games(self):
+        cfg = {"daily": {"popular": True}}
+        fa.daily_run(cfg)
+        self.assertIn(cfg["daily"]["game"], ("Halo 3", "Grand Theft Auto V"))  # the only games with fanart
 
 
 class Exophase(unittest.TestCase):

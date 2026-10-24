@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fetchart"
 dynamic = ["version"]
-description = "Find and download game art, movie posters and album covers from the command line."
+description = "Download game art, achievements, posters, album covers, paintings, Pokémon, Minecraft skins and more from the command line."
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Samuel Arther" }]
 requires-python = ">=3.9"
 dependencies = ["Pillow>=9"]
-keywords = ["game art", "box art", "cover art", "xbox", "launchbox", "cli"]
+keywords = ["game art", "box art", "cover art", "achievements", "steam grid", "emulation", "plex", "wallpaper", "launchbox", "cli"]
 classifiers = [
     "Environment :: Console",
     "Programming Language :: Python :: 3",

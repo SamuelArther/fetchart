@@ -1,0 +1,23 @@
+name: PyPI
+
+# Publishes each release to PyPI with trusted publishing (no token stored anywhere). It stays off until
+# the repository variable PUBLISH_TO_PYPI is "true", which is set once PyPI knows about this workflow.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: vars.PUBLISH_TO_PYPI == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build && python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
