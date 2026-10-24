@@ -165,13 +165,21 @@ chmod +x fetchart-macos
 
 On macOS you may also need to right-click it and choose **Open** the first time, because the build isn't signed.
 
+### With Homebrew (macOS, Linux, or brew-windows)
+
+```
+brew install samuelarther/tap/fetchart
+```
+
+It builds from the PyPI package with Homebrew's Python and Pillow on macOS and Linux. On Windows, [brew-windows](https://github.com/SamuelArther/brew-windows) installs the standalone build.
+
 ### With Python (3.9+)
 
 ```
-pipx install git+https://github.com/SamuelArther/fetchart
+pipx install fetchart
 ```
 
-`pip install git+https://github.com/SamuelArther/fetchart` works too.
+`pip install fetchart` works too.
 
 ## Usage
 
