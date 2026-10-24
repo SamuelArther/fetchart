@@ -1,10 +1,10 @@
 # fetchart
 
-Find and download game art, movie and TV posters, album covers, paintings, Pokémon, Minecraft skins, anime, book covers and app icons from the command line. No API keys or accounts are needed.
+Find and download game art, movie and TV posters, album covers, paintings, Pokémon, Minecraft skins, anime, book covers, app icons, trading cards, amiibo, podcast covers, artist photos and NASA space pictures from the command line. No API keys or accounts are needed.
 
-For games, it covers about 190,000 titles on every platform: front and back covers, 3D boxes, discs and cartridges, screenshots, old magazine ads, key art (with or without the logo), see-through logos, console dashboard tiles, and achievement and trophy icons for Xbox, PlayStation, Steam and retro consoles.
+For games, it covers about 190,000 titles on every platform: front and back covers, special edition covers (Deluxe, Collector's, Game of the Year...), 3D boxes, discs and cartridges, screenshots, old magazine ads, key art (with or without the logo), see-through logos, console dashboard tiles, achievement and trophy icons for Xbox, PlayStation, Steam and retro consoles, and game info (description, release date, developer, rating).
 
-It also works on whole libraries: art for every ROM in a folder, posters for a Plex or Jellyfin movie folder, covers for a music folder, Steam library art for your non-Steam games, and a "box wall" poster of a whole collection. And it can set any of it as your wallpaper, or give you a new one every day.
+It also works on whole libraries: art and a `gamelist.xml` for every ROM in a folder, RetroArch thumbnails, posters for a Plex or Jellyfin movie folder, covers for a music folder, Steam library art for your non-Steam games, a report of what's still missing, a watch mode that gets art for new games as they arrive, and a "box wall" poster of a whole collection. And it can set any of it as your wallpaper, or give you a new one every day (or every hour).
 
 ![fetchart finding the Xbox 360 box art for Modern Warfare 2](docs/demo.gif)
 
@@ -12,7 +12,7 @@ Just type `fetchart` in PowerShell, Command Prompt or any terminal, and pick wha
 
 Type the name, then pick the right one from the matches. Each game appears once, and you pick the platform after it. Then pick the kind of art, choose from every image found (biggest first), and pick a folder. For key art, also pick its shape: landscape, portrait, a phone wallpaper, or ultrawide (21:9 or 32:9). fetchart remembers the last folder you used.
 
-**Controls:** use the arrow keys or click with the mouse, and press Enter. Typing a number jumps to it. On the image and achievement lists, press **P** to see every option as a numbered picture in your browser. For achievements, Space (or a click) ticks as many as you want, and A ticks them all. Mouse clicks work in the Windows console; on macOS and Linux, use the keys.
+**Controls:** use the arrow keys or click with the mouse, and press Enter. Typing a number jumps to it. On the image and achievement lists, press **S** for a contact sheet: every option as one numbered picture, drawn right in the terminal in Windows Terminal, WezTerm, iTerm2 and kitty (anywhere else it opens in your picture viewer). **P** shows them in your browser instead. For achievements, Space (or a click) ticks as many as you want, and A ticks them all. Mouse clicks work in the Windows console; on macOS and Linux, use the keys.
 
 ### A whole folder of games
 
@@ -32,6 +32,20 @@ fetchart --folder D:\ROMs\N64
 
 The art goes in a folder inside the ROM folder, named the way ES-DE names them: `covers`, `backcovers`, `3dboxes`, `physicalmedia`, `screenshots`, `fanart`, `marquees` (logos), plus `keyart`, `icons` and `flyers`. `-o` picks another.
 
+**Game info:** pick "Game info" from the menu (or `-t info`) and fetchart writes a `gamelist.xml` with every game's name, description, release date, developer, publisher, genre, players and rating, linked to the art it saved. Batocera, RetroBat, Recalbox and Pegasus read it from the ROM folder; if ES-DE is installed, its own copy in `ES-DE/gamelists` is updated too. Anything already in the file (play counts, favourites) is kept.
+
+**What's missing:** `fetchart --missing D:\ROMs\N64` lists which games have no cover, screenshot, logo or info yet, then offers to get them. It works on movie and music folders too.
+
+**Watch mode:** `fetchart --watch D:\ROMs\N64` keeps running and gets the art for each new game as soon as it lands in the folder.
+
+### RetroArch thumbnails
+
+```
+fetchart --retroarch
+```
+
+Every game in RetroArch's playlists gets its box art, screenshot, title screen and logo, in the thumbnail folders RetroArch shows in its menus. Thumbnails already there are never replaced. fetchart finds RetroArch in its usual places, or give it the folder: `fetchart --retroarch "D:\RetroArch"`.
+
 ### Box wall
 
 ![A box wall of N64 games](docs/boxwall.jpg)
@@ -44,6 +58,8 @@ fetchart --collage D:\ROMs\N64 -w
 ```
 
 It uses the pictures in the folder, or its `covers` folder. A ROM folder with no art yet gets its box art first. Add `-w` to make it your wallpaper.
+
+Pick the shape with `-r` (`landscape`, `ultrawide`, `superwide`, `phone`, or `portrait` for printing), the background with `--bg` (`black`, `white`, any colour like `navy` or `#202030`, or `blur` for blurred cover art), and the order with `--sort name`, `year` or `random`. The menus ask about all three.
 
 ### A folder of movies or TV shows
 
@@ -118,11 +134,11 @@ fetchart --daily
 fetchart --daily off
 ```
 
-You can give it some games, a platform (its most popular games), or nothing (popular games from everywhere). It changes the wallpaper right away, then every morning, or the first time the computer is on that day. Windows uses Task Scheduler, macOS uses launchd, and Linux uses a systemd user timer.
+You can give it some games, a platform (its most popular games), `space` (NASA's Astronomy Picture of the Day), or nothing (popular games from everywhere). It changes the wallpaper right away, then every morning, or the first time the computer is on that day. Add `--every 1h` (or `30m`, `6h`...) to change it more often. Windows uses Task Scheduler, macOS uses launchd, and Linux uses a systemd user timer.
 
 To go back to the wallpaper you had before, run `fetchart --undo-wallpaper`, even after several `-w` runs or daily changes (it turns the daily wallpaper off too). fetchart keeps a copy of your old picture, so it works even if the original file is gone. A Windows slideshow or Spotlight comes back as the single picture that was showing.
 
-### Pokémon, Minecraft skins, anime, books and apps
+### Pokémon, Minecraft skins, cards, amiibo and more
 
 Use the word in place of a platform, or pick it from the menu:
 
@@ -133,6 +149,15 @@ fetchart attack-on-titan anime
 fetchart berserk manga
 fetchart "the hobbit" book
 fetchart minecraft app
+fetchart instagram app -t icon
+fetchart charizard pokemon-card
+fetchart lightning-bolt mtg
+fetchart dark-magician yugioh
+fetchart link amiibo
+fetchart serial podcast
+fetchart daft-punk artist
+fetchart pillars-of-creation space
+fetchart space
 ```
 
 | Search | What you get | Where it comes from |
@@ -141,7 +166,12 @@ fetchart minecraft app
 | Minecraft | A 3D render of the player's head, their whole body, their face, the skin file itself, and their cape | Mojang |
 | Anime / manga | Cover and banner | [AniList](https://anilist.co/) |
 | Books | The cover, plus other editions' covers | [Open Library](https://openlibrary.org/) |
-| Apps | The 1024x1024 App Store icon and full-size screenshots | Apple App Store |
+| Apps | The 1024x1024 App Store icon and full-size screenshots, or every icon the app has ever had (`-t icon`, or pick it from the menu) | Apple App Store, old App Store pages from the [Wayback Machine](https://web.archive.org/) |
+| Trading cards | Every printing of a card: Pokémon, Magic: The Gathering or Yu-Gi-Oh! (`card` searches all three) | [TCGdex](https://tcgdex.dev/), [Scryfall](https://scryfall.com/), [YGOPRODeck](https://ygoprodeck.com/) |
+| amiibo | The amiibo's picture, plus a text file with its series, release dates and what it unlocks in every game | [AmiiboAPI](https://www.amiiboapi.org/) |
+| Podcasts | The cover at up to 3000x3000 | Apple Podcasts |
+| Artists | A photo of the artist or band | Deezer, Wikipedia |
+| Space | NASA's Astronomy Picture of the Day (`fetchart space` for today's), or any search of NASA's image library | NASA |
 
 ## Install
 
@@ -173,6 +203,13 @@ brew install samuelarther/tap/fetchart
 
 It builds from the PyPI package with Homebrew's Python and Pillow on macOS and Linux. On Windows, [brew-windows](https://github.com/SamuelArther/brew-windows) installs the standalone build.
 
+### With Scoop (Windows)
+
+```
+scoop bucket add samuelarther https://github.com/SamuelArther/scoop-bucket
+scoop install samuelarther/fetchart
+```
+
 ### With Python (3.9+)
 
 ```
@@ -202,13 +239,18 @@ Short names work too: `mw2`, `bo2`, `botw`, `oot`, `gta5`, `ff7`, `csgo`, `ssbm`
 | `-y` | No prompts: take the top match and the best image |
 | `-w` | Set the picture as your desktop wallpaper |
 | `--undo-wallpaper` | Put back the wallpaper you had before |
-| `--daily [GAMES\|PLATFORM\|off]` | A new game wallpaper every day (see above) |
+| `--daily [GAMES\|PLATFORM\|space\|off]` | A new wallpaper every day (see above) |
+| `--every 30m\|1h\|6h` | With `--daily`: change it more often |
 | `-f FOLDER` | Get art for every game, movie, show or album in a folder (see above) |
-| `--collage FOLDER` | Make a box wall poster (see above) |
+| `--collage FOLDER` | Make a box wall poster (see above), with `--sort name\|year\|random` and `--bg COLOR\|blur` |
+| `--retroarch [DIR]` | Fill RetroArch's thumbnails for its playlists (see above) |
+| `--missing FOLDER` | List what has no art yet, then get it (see above) |
+| `--watch FOLDER` | Get art for new games as they arrive (see above) |
 | `--list FILE` | Get art for every name in a text file (see above) |
 | `--steam` | Fill in Steam's library art for your non-Steam games (see above) |
 | `--completion powershell\|bash\|zsh` | Print the Tab completion script (see below) |
 | `--update` | Re-download the game database |
+| `--upgrade` | Update fetchart itself, the same way it was installed |
 
 ### Tab completion
 
@@ -267,6 +309,7 @@ Full names work too, e.g. `"Sega Dreamcast"`.
 | Type | What you get | Where it comes from |
 |---|---|---|
 | **box** | The front cover from every region, rating and all | LaunchBox Games Database |
+| **edition** | Covers of the game's special editions: Deluxe, Gold, Ultimate, Collector's, Limited, Game of the Year, Legendary... | LaunchBox, Microsoft Store |
 | **back** | The back of the box | LaunchBox |
 | **box3d** | The whole box at an angle, see-through background | LaunchBox |
 | **disc** | The disc or cartridge | LaunchBox |
@@ -278,6 +321,7 @@ Full names work too, e.g. `"Sega Dreamcast"`.
 | **icon** | The square tile on the console's menu | See below |
 | **ach** | Achievement or trophy icons, listed by name, score and description. Pick one, a few (`1,4,9` or `10-20`), or all of them | See below |
 | **wallpaper** | The best landscape key art, set as your desktop background | Same as **clean** |
+| **info** | The game's description, release date, developer, publisher, genre, players and rating, shown and saved as a text file | LaunchBox |
 
 Achievements and trophies, by platform:
 

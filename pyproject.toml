@@ -11,7 +11,7 @@ license = "MIT"
 authors = [{ name = "Samuel Arther" }]
 requires-python = ">=3.9"
 dependencies = ["Pillow>=9"]
-keywords = ["game art", "box art", "cover art", "achievements", "steam grid", "emulation", "plex", "wallpaper", "launchbox", "cli"]
+keywords = ["game art", "box art", "cover art", "achievements", "steam grid", "emulation", "plex", "wallpaper", "launchbox", "retroarch", "gamelist", "trading cards", "amiibo", "cli"]
 classifiers = [
     "Environment :: Console",
     "Programming Language :: Python :: 3",
@@ -23,7 +23,7 @@ classifiers = [
 Homepage = "https://github.com/SamuelArther/fetchart"
 
 [project.scripts]
-fetchart = "fetchart:main"
+fetchart = "fetchart:run"
 
 [tool.setuptools]
 py-modules = ["fetchart"]

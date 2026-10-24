@@ -373,6 +373,169 @@ class Exophase(unittest.TestCase):
             self.assertIn(plat, fa.ACH_SOURCES)
 
 
+class Rotation(Daily):
+    """--daily with --every: a new picture every so often, and NASA's pictures."""
+
+    def test_every_hour(self):
+        cfg = {"daily": {"games": [[6, "Halo 3", X360], [10, "Grand Theft Auto V", PS4]], "every": 60}}
+        fa.daily_run(cfg)
+        fa.daily_run(cfg)  # too soon
+        self.assertEqual(len(self.set), 1)
+        cfg["daily"]["last_time"] -= 3600
+        fa.daily_run(cfg)
+        self.assertEqual(len(self.set), 2)
+
+    def test_space(self):
+        saved = fa.apod_items
+        fa.apod_items = lambda: [("2026-10-24", "Rosetta's Selfie", "https://x/a.jpg"),
+                                 ("2026-10-23", "Andromeda", "https://x/b.jpg")]
+        try:
+            cfg = {"daily": {"space": True}}
+            fa.daily_run(cfg)
+            self.assertEqual(cfg["daily"]["game"], "Rosetta's Selfie")  # today's picture of the day
+        finally:
+            fa.apod_items = saved
+
+    def test_parse_every(self):
+        self.assertEqual([fa.parse_every(t) for t in ("30m", "1h", "2 hours", "day")], [30, 60, 120, None])
+        self.assertEqual(fa.every_text(120), "every 2 hours")
+        with self.assertRaises(SystemExit):
+            fa.parse_every("1m")
+
+
+class Editions(unittest.TestCase):
+    def test_base_title(self):
+        for title, base in [("Halo 3: Legendary Edition", "Halo 3"), ("Halo 3 Limited Edition", "Halo 3"),
+                            ("Grand Theft Auto IV: The Complete Edition", "Grand Theft Auto IV"),
+                            ("Fallout 3 Game of the Year Edition", "Fallout 3"), ("Halo 3 Mythic Edition", "Halo 3"),
+                            ("Minecraft: Xbox 360 Edition", "Minecraft: Xbox 360"), ("Halo 3", "Halo 3")]:
+            self.assertEqual(fa.base_title(title), base, title)
+
+    def test_edition_covers(self):
+        db = fixture_db()
+        for gid, name in ((20, "Halo 3 Limited Edition"), (21, "Halo 3: Legendary Edition"), (22, "Halo 3: ODST")):
+            db.execute("INSERT INTO games VALUES (?,?,?,?,?)", (gid, name, X360, 10, 2007))
+            db.execute("INSERT INTO names VALUES (?,?,?,?)", (gid, name, fa.norm(name), fa.acronyms(name)))
+            db.execute("INSERT INTO images VALUES (?, 'Box - Front', 'North America', ?)", (gid, f"{gid}.jpg"))
+        saved, fa.ms_store_editions = fa.ms_store_editions, lambda base: []
+        try:
+            labels = [a.source for a in fa.edition_covers(db, 6, "Halo 3", X360)]
+        finally:
+            fa.ms_store_editions = saved
+        self.assertEqual(sorted(labels), [f"Legendary Edition [{X360}], North America",
+                                          f"Limited Edition [{X360}], North America"])  # not ODST, a different game
+
+
+class GameInfo(unittest.TestCase):
+    def setUp(self):
+        self.db = fixture_db()
+        self.db.execute("CREATE TABLE info (id INTEGER PRIMARY KEY, released TEXT, overview BLOB, developer TEXT, "
+                        "publisher TEXT, genres TEXT, players TEXT, rating REAL, esrb TEXT)")
+        self.db.execute("INSERT INTO info VALUES (6, '2007-09-25', ?, 'Bungie', 'Microsoft', 'Shooter; Action', '4', "
+                        "4.5, 'M - Mature')", (zlib.compress(b"Finish the fight."),))
+
+    def test_info(self):
+        info = fa.game_info(self.db, 6)
+        self.assertEqual((info["overview"], info["developer"]), ("Finish the fight.", "Bungie"))
+        self.assertIn("Rating:    4.5 out of 5", fa.info_text("Halo 3", X360, info))
+        self.assertEqual(fa.game_info(self.db, 99), {})
+
+    def test_gamelist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "Halo 3 (USA).iso").write_bytes(b"")
+            (folder / "covers").mkdir()
+            (folder / "covers" / "Halo 3 (USA).png").write_bytes(b"")
+            fields = fa.gamelist_fields(self.db, folder, "Halo 3 (USA)", (6, "Halo 3", X360))
+            self.assertEqual((fields["releasedate"], fields["rating"], fields["genre"], fields["thumbnail"]),
+                             ("20070925T000000", "0.90", "Shooter, Action", "./covers/Halo 3 (USA).png"))
+            path = folder / "gamelist.xml"
+            path.write_text('<?xml version="1.0"?>\n<gameList><game><path>./Halo 3 (USA).iso</path>'
+                            "<playcount>7</playcount></game><game><path>./other.iso</path></game></gameList>")
+            self.assertEqual(fa.update_gamelist(path, [("./Halo 3 (USA).iso", fields), ("./new.iso", {"name": "New"})]), 1)
+            games = {g.findtext("path"): g for g in fa.ET.parse(path).getroot().findall("game")}
+            self.assertEqual(len(games), 3)
+            self.assertEqual(games["./Halo 3 (USA).iso"].findtext("playcount"), "7")  # kept
+            self.assertEqual(games["./Halo 3 (USA).iso"].findtext("developer"), "Bungie")
+            self.assertTrue((folder / "gamelist.xml.bak").exists())
+
+
+class RetroArch(unittest.TestCase):
+    def test_thumbnail_name(self):
+        self.assertEqual(fa.thumbnail_name('Q*bert: "Arcade" & More?'), "Q_bert_ _Arcade_ _ More_.png")
+
+    def test_playlists_and_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "retroarch.cfg").write_text('playlist_directory = ":\\playlists"\nthumbnails_directory = "default"\n')
+            self.assertEqual(fa.retroarch_dirs(root), (root / "playlists", root / "thumbnails"))
+            new = root / "Nintendo - Nintendo 64.lpl"
+            new.write_text('{"version": "1.5", "items": [{"path": "a.z64", "label": "Super Mario 64 (USA)", '
+                           '"db_name": "Nintendo - Nintendo 64.lpl"}]}')
+            self.assertEqual(fa.read_playlist(new), [("Super Mario 64 (USA)", "Nintendo - Nintendo 64")])
+            old = root / "old.lpl"
+            old.write_text("C:/roms/a.sfc\nSuper Metroid\nDETECT\nDETECT\n0|crc\nNintendo - Super Nintendo "
+                           "Entertainment System.lpl\n")
+            self.assertEqual(fa.read_playlist(old), [("Super Metroid", "Nintendo - Super Nintendo Entertainment System")])
+
+
+class AppIcons(unittest.TestCase):
+    def test_originals(self):
+        self.assertEqual(fa.mzstatic_originals(
+            "https://is2-ssl.mzstatic.com/image/thumb/Purple113/v4/7a/AppIcon.png/1200x630wa.png"),
+            ["https://is1-ssl.mzstatic.com/image/thumb/Purple113/v4/7a/AppIcon.png/1024x1024bb.png"])
+        self.assertEqual(fa.mzstatic_originals(
+            "http://a1.phobos.apple.com/us/r1000/046/Purple/b7/6e/73/mzi.zdfbmlsm.175x175-75.jpg")[0],
+            "https://is1-ssl.mzstatic.com/image/thumb/Purple/b7/6e/73/mzi.zdfbmlsm.png/1024x1024bb.png")
+
+    def test_icon_on_page(self):
+        new = '<meta property="og:image" content="https://is2-ssl.mzstatic.com/image/thumb/P/AppIcon.png/1200x630wa.png">'
+        self.assertTrue(fa.icon_on_page(new, "Instagram").endswith("1200x630wa.png"))
+        old = ('<img src="http://a1.phobos.apple.com/other.100x100-75.jpg" class="artwork" alt="Diptic">'
+               '<img src="http://a1.phobos.apple.com/us/r1000/046/x.175x175-75.jpg" width="175" class="artwork" alt="Instagram">')
+        self.assertEqual(fa.icon_on_page(old, "Instagram"), "http://a1.phobos.apple.com/us/r1000/046/x.175x175-75.jpg")
+
+
+class Pictures(unittest.TestCase):
+    def test_sixel_round_trip(self):
+        Image, _ = fa.pil()
+        img = Image.new("RGB", (40, 15), "navy")
+        img.paste((255, 200, 0), (5, 3, 30, 11))
+        code = fa.sixel(img)
+        self.assertTrue(code.startswith('\x1bPq"1;1;40;15') and code.endswith("\x1b\\"))
+        want = img.quantize(255)
+        palette = want.getpalette()
+        got = Image.new("RGB", img.size)
+        x = y = color = 0
+        import re
+        for tok in re.findall(r"#\d+;2;[\d;]+|#\d+|!\d+[?-~]|[?-~]|\$|-", code[code.index("#"):-2]):
+            if tok.startswith("#"):
+                color = int(tok[1:].split(";")[0])
+            elif tok in "$-":
+                x, y = 0, y + (6 if tok == "-" else 0)
+            else:
+                n, ch = (int(tok[1:-1]), tok[-1]) if tok[0] == "!" else (1, tok)
+                for _ in range(n):
+                    for k in range(6):
+                        if (ord(ch) - 63) >> k & 1 and y + k < img.height:
+                            got.putpixel((x, y + k), tuple(palette[color * 3:color * 3 + 3]))
+                    x += 1
+        self.assertEqual(got.tobytes(), want.convert("RGB").tobytes())
+
+    def test_box_wall_shapes(self):
+        Image, _ = fa.pil()
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i in range(7):
+                paths.append(Path(tmp) / f"{i}.png")
+                Image.new("RGB", (200, 300), (i * 30, 0, 0)).save(paths[-1])
+            self.assertEqual(fa.make_collage(paths).size, (3840, 2160))
+            self.assertEqual(fa.make_collage(paths, 9 / 19.5, background="blur").size, (1772, 3840))
+
+    def test_versions(self):
+        self.assertGreater(fa.version_tuple("1.10.0"), fa.version_tuple("1.9.2"))
+
+
 @unittest.skipUnless(LIVE and fa.DB_PATH.exists(), "set FETCHART_LIVE=1 (needs the downloaded database)")
 class Live(unittest.TestCase):
     @classmethod
